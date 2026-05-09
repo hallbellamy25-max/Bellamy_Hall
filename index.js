@@ -243,7 +243,7 @@ const CONFIG_HELP =
 async function handleConfig(message, args) {
   // Require Manage Guild permission
   if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    return message.reply("ma3andekch permission (Manage Server).").then((m) => setTimeout(() => m.delete(), 4000));
+    return message.reply("ma3andekch permission .").then((m) => setTimeout(() => m.delete(), 4000));
   }
 
   const sub    = args[0]?.toLowerCase(); // "channel" | "role" | "show"
@@ -408,7 +408,7 @@ async function handleOffence(message, offendingContent) {
           $push: { badWordHistory: { $each: [{ content: offendingContent.slice(0, 500), channelId: channel.id, action: "ban", timestamp: now }], $slice: -50 } },
         }
       );
-      author.send("☕ Coffee Bean: rak tbant. 3 timeouts w mazelt ma tfhemtech. bye.").catch(() => {});
+      author.send("koul ban . 3 timeouts w mazelt ma fhemtech ro7ek . bye.").catch(() => {});
       await guild.members.ban(author.id, { reason: "3 timeouts — repeated bad word offences" }).catch(console.error);
 
     } else {
@@ -430,11 +430,11 @@ async function handleOffence(message, offendingContent) {
 
       const durationStr = msToHuman(duration);
       message.channel
-        .send(`⏱️ ${author} , 3 warns w mazelt mafhemtech — rak muted **${durationStr}**. (timeout #${timeouts}/3)`)
+        .send(`⏱️ ${author} , 3 warns w mazelt mafhemtech — get muted **${durationStr}**. (timeout #${timeouts}/3)`)
         .then((m) => setTimeout(() => m.delete(), 8000));
       author.send(
-        `☕ Coffee Bean: rak muted **${durationStr}** 3la 9a7el el klam el zayed.\n` +
-        `Timeout #${timeouts}/3 — el jey ykon akbar. barka 3leha.`
+        ` koul mute **${durationStr}** 5atrek kathart mel lklam el zayed.\n` +
+        `Timeout #${timeouts}/3 — el jey ykoun akbar. yezzi bla klam zayed 5irlek .`
       ).catch(() => {});
     }
 
