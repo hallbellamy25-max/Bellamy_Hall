@@ -21,40 +21,28 @@ mongoose
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  SCHEMA: GuildConfig
-//  One document per guild — stores allowed channels & exempt roles
 // ══════════════════════════════════════════════════════════════════════════════
 const guildConfigSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
-
-  // Channel IDs the bot actively reads & moderates.
-  // Empty array = bot works in ALL channels (default behaviour).
   allowedChannels: { type: [String], default: [] },
-
-  // Role IDs that are completely exempt from bad-word detection / warns.
-  // Add admin / mod / owner roles here.
-  exemptRoles: { type: [String], default: [] },
-
-  // Role IDs allowed to use !config and !toggle.
-  // Only someone with Manage Server can add/remove these via !admin.
-  configRoles: { type: [String], default: [] },
-
+  exemptRoles:     { type: [String], default: [] },
+  configRoles:     { type: [String], default: [] },
+  logChannelId:    { type: String,   default: null },  // null = fall back to name-based lookup
   updatedAt: { type: Date, default: Date.now },
 });
 const GuildConfig = mongoose.model("GuildConfig", guildConfigSchema);
 
-// In-memory cache so we don't hit MongoDB on every single message
-const configCache = new Map(); // guildId → { allowedChannels: Set, exemptRoles: Set }
+const configCache = new Map();
 
 async function getConfig(guildId) {
   if (configCache.has(guildId)) return configCache.get(guildId);
-
   let doc = await GuildConfig.findOne({ guildId });
   if (!doc) doc = await GuildConfig.create({ guildId });
-
   const cfg = {
     allowedChannels: new Set(doc.allowedChannels),
     exemptRoles:     new Set(doc.exemptRoles),
     configRoles:     new Set(doc.configRoles),
+    logChannelId:    doc.logChannelId ?? null,
   };
   configCache.set(guildId, cfg);
   return cfg;
@@ -71,7 +59,6 @@ const memberSchema = new mongoose.Schema({
   userId:   { type: String, required: true },
   guildId:  { type: String, required: true },
   username: { type: String },
-
   lastMessages: {
     type: [{
       content:     String,
@@ -81,12 +68,10 @@ const memberSchema = new mongoose.Schema({
     }],
     default: [],
   },
-
   warns:         { type: Number, default: 0 },
   lastWarnAt:    { type: Date,   default: null },
   timeouts:      { type: Number, default: 0 },
   lastTimeoutAt: { type: Date,   default: null },
-
   badWordHistory: {
     type: [{
       content:   String,
@@ -96,7 +81,6 @@ const memberSchema = new mongoose.Schema({
     }],
     default: [],
   },
-
   joinedAt:  { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });
@@ -112,6 +96,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildVoiceStates,   // needed for voice logs
   ],
 });
 
@@ -201,11 +186,20 @@ function isBadInHistory(userId, content) {
 // ─── Logger ───────────────────────────────────────────────────────────────────
 const LOG_CHANNEL_NAME = "📊・brew-logs";
 
-function getLogChannel(guild) {
+async function getLogChannelId(guildId) {
+  if (configCache.has(guildId)) return configCache.get(guildId).logChannelId ?? null;
+  const doc = await GuildConfig.findOne({ guildId });
+  return doc?.logChannelId ?? null;
+}
+
+function getLogChannel(guild, logChannelId) {
+  if (logChannelId) return guild.channels.cache.get(logChannelId) ?? null;
   return guild.channels.cache.find((ch) => ch.name === LOG_CHANNEL_NAME) ?? null;
 }
-async function sendLog(guild, { color, emoji, title, fields, footer }) {
-  const ch = getLogChannel(guild);
+async function sendLog(guild, { color, emoji, title, fields, footer }, logChannelId) {
+  if (!features.logs) return;
+  const resolvedId = logChannelId ?? await getLogChannelId(guild.id);
+  const ch = getLogChannel(guild, resolvedId);
   if (!ch) return;
   const embed = new EmbedBuilder().setColor(color).setTitle(`${emoji}  ${title}`).addFields(fields).setTimestamp();
   if (footer) embed.setFooter({ text: footer });
@@ -213,21 +207,29 @@ async function sendLog(guild, { color, emoji, title, fields, footer }) {
 }
 function timestamp() { return `<t:${Math.floor(Date.now() / 1000)}:T>`; }
 
-const Colors = { warn: "#FEE75C", timeout: "#E67E22", ban: "#FF0000", info: "#5865F2", ok: "#57F287", error: "#ED4245" };
+const Colors = {
+  warn:    "#FEE75C",
+  timeout: "#E67E22",
+  ban:     "#FF0000",
+  info:    "#5865F2",
+  ok:      "#57F287",
+  error:   "#ED4245",
+  join:    "#43B581",
+  leave:   "#747F8D",
+  delete:  "#ED4245",
+  edit:    "#FAA61A",
+  voice:   "#9B59B6",
+  nick:    "#3498DB",
+  unban:   "#57F287",
+};
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PERMISSION SYSTEM
-//
-//  !admin  → Manage Server only → grants/revokes roles access to !config & !toggle
-//  !config → Manage Server  OR  roles added via !admin
-//  !toggle → Manage Server  OR  roles added via !admin
 // ══════════════════════════════════════════════════════════════════════════════
 
 function hasManageGuild(member) {
   return member.permissions.has(PermissionFlagsBits.ManageGuild);
 }
-
-// Returns true if member has Manage Server OR one of the configRoles
 function hasConfigAccess(member, cfg) {
   return (
     hasManageGuild(member) ||
@@ -236,7 +238,6 @@ function hasConfigAccess(member, cfg) {
 }
 
 // ── Help strings ──────────────────────────────────────────────────────────────
-
 const ADMIN_HELP =
   "**!admin** *(Manage Server only)*\n\n" +
   "`!admin role add @role` — give a role access to !config and !toggle\n" +
@@ -256,7 +257,11 @@ const CONFIG_HELP =
   "`!config role remove @role` — remove exemption\n" +
   "`!config role list` — show exempt roles\n" +
   "`!config role clear` — clear all exemptions\n\n" +
-  "`!config show` — show current config";
+  "**Log channel:**\n" +
+  "`!config logs set #channel` — set the log channel\n" +
+  "`!config logs clear` — go back to name-based fallback (📊・brew-logs)\n" +
+  "`!config logs show` — show current log channel\n\n" +
+  "`!config show` — show full current config";
 
 const TOGGLE_HELP =
   "**!toggle** *(admin role or Manage Server required)*\n" +
@@ -265,40 +270,33 @@ const TOGGLE_HELP =
   "`!toggle status` — show current feature states";
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  !admin — only Manage Server can run this
-//  Controls which roles get access to !config and !toggle
+//  !admin
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function handleAdmin(message, args) {
   if (!hasManageGuild(message.member)) {
     return message.reply("ma3andekch permission. lazem **Manage Server** bch testa3mel !admin.")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
-  const sub     = args[0]?.toLowerCase(); // "role" | "show"
-  const action  = args[1]?.toLowerCase(); // "add" | "remove" | "list"
+  const sub     = args[0]?.toLowerCase();
+  const action  = args[1]?.toLowerCase();
   const guildId = message.guild.id;
 
-  // ── !admin show — lists all channels + roles with IDs ─────────────────────
   if (sub === "show" || !sub) {
     const doc = await GuildConfig.findOne({ guildId }) ?? { configRoles: [] };
-
     const configRoleList = doc.configRoles?.length
       ? doc.configRoles.map((id) => `<@&${id}>`).join(", ")
       : "None — only Manage Server users can use !config and !toggle";
-
     const allChannels = message.guild.channels.cache
       .filter((c) => c.type === ChannelType.GuildText)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((c) => `#${c.name} — \`${c.id}\``)
       .join("\n") || "none";
-
     const allRoles = message.guild.roles.cache
       .filter((r) => !r.managed && r.id !== message.guild.id)
       .sort((a, b) => b.position - a.position)
       .map((r) => `@${r.name} — \`${r.id}\``)
       .join("\n") || "none";
-
     const embed = new EmbedBuilder()
       .setColor(Colors.info)
       .setTitle("🔐  Admin Panel")
@@ -309,11 +307,9 @@ async function handleAdmin(message, args) {
       )
       .setFooter({ text: "Use these IDs with !config channel add / !config role add" })
       .setTimestamp();
-
     return message.channel.send({ embeds: [embed] });
   }
 
-  // ── !admin role ────────────────────────────────────────────────────────────
   if (sub === "role") {
     if (action === "list") {
       const doc = await GuildConfig.findOne({ guildId }) ?? { configRoles: [] };
@@ -322,12 +318,10 @@ async function handleAdmin(message, args) {
         : "None.";
       return message.reply(`🔧 Roles with !config & !toggle access: ${list}`);
     }
-
     const targetRole = message.mentions.roles.first();
     if (!targetRole)
       return message.reply("Mentionni el role. ex: `!admin role add @Admin`")
         .then((m) => setTimeout(() => m.delete(), 5000));
-
     if (action === "add") {
       await GuildConfig.findOneAndUpdate(
         { guildId },
@@ -337,7 +331,6 @@ async function handleAdmin(message, args) {
       invalidateCache(guildId);
       return message.reply(`✅ <@&${targetRole.id}> can now use \`!config\` and \`!toggle\`.`);
     }
-
     if (action === "remove") {
       await GuildConfig.findOneAndUpdate(
         { guildId },
@@ -346,7 +339,6 @@ async function handleAdmin(message, args) {
       invalidateCache(guildId);
       return message.reply(`✅ <@&${targetRole.id}> no longer has access to \`!config\` and \`!toggle\`.`);
     }
-
     return message.reply(ADMIN_HELP);
   }
 
@@ -354,9 +346,8 @@ async function handleAdmin(message, args) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  !config — Manage Server OR configRole
+//  !config
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function handleConfig(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
     return message.reply("ma3andekch permission. 9arra9 badmin bch ta5ou el access.")
@@ -367,31 +358,30 @@ async function handleConfig(message, args, cfg) {
   const action  = args[1]?.toLowerCase();
   const guildId = message.guild.id;
 
-  // ── !config show ──────────────────────────────────────────────────────────
   if (sub === "show" || !sub) {
-    const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [], exemptRoles: [] };
-
+    const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [], exemptRoles: [], logChannelId: null };
     const chList = doc.allowedChannels.length
       ? doc.allowedChannels.map((id) => `<#${id}>`).join(", ")
       : "All channels (no restriction)";
     const exemptList = doc.exemptRoles.length
       ? doc.exemptRoles.map((id) => `<@&${id}>`).join(", ")
       : "None";
-
+    const logChDisplay = doc.logChannelId
+      ? `<#${doc.logChannelId}> (ID: \`${doc.logChannelId}\`)`
+      : `Name-based fallback: **${LOG_CHANNEL_NAME}**`;
     const embed = new EmbedBuilder()
       .setColor(Colors.info)
       .setTitle("⚙️  Bot Config")
       .addFields(
         { name: "✅ Active channels (bot reads & moderates)", value: chList },
         { name: "🛡️ Exempt roles (no warns/detection)", value: exemptList },
+        { name: "📋 Log channel", value: logChDisplay },
       )
       .setFooter({ text: "Use !admin show to see all channel & role IDs" })
       .setTimestamp();
-
     return message.channel.send({ embeds: [embed] });
   }
 
-  // ── !config channel ────────────────────────────────────────────────────────
   if (sub === "channel") {
     if (action === "list") {
       const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [] };
@@ -422,10 +412,8 @@ async function handleConfig(message, args, cfg) {
     return message.reply(CONFIG_HELP);
   }
 
-  // ── !config role ───────────────────────────────────────────────────────────
   if (sub === "role") {
     const targetRole = message.mentions.roles.first();
-
     if (action === "list") {
       const doc = await GuildConfig.findOne({ guildId }) ?? { exemptRoles: [] };
       const list = doc.exemptRoles.length ? doc.exemptRoles.map((id) => `<@&${id}>`).join(", ") : "None.";
@@ -451,13 +439,37 @@ async function handleConfig(message, args, cfg) {
     return message.reply(CONFIG_HELP);
   }
 
+  // ── !config logs ───────────────────────────────────────────────────────────
+  if (sub === "logs") {
+    if (action === "show") {
+      const doc = await GuildConfig.findOne({ guildId });
+      const logChDisplay = doc?.logChannelId
+        ? `<#${doc.logChannelId}> (\`${doc.logChannelId}\`)`
+        : `Name-based fallback: **${LOG_CHANNEL_NAME}**`;
+      return message.reply(`📋 Log channel: ${logChDisplay}`);
+    }
+    if (action === "clear") {
+      await GuildConfig.findOneAndUpdate({ guildId }, { $set: { logChannelId: null, updatedAt: new Date() } }, { upsert: true });
+      invalidateCache(guildId);
+      return message.reply(`✅ Log channel cleared — falling back to **${LOG_CHANNEL_NAME}** by name.`);
+    }
+    if (action === "set") {
+      const targetChannel = message.mentions.channels.first();
+      if (!targetChannel)
+        return message.reply("Mentionni el channel. ex: `!config logs set #logs`")
+          .then((m) => setTimeout(() => m.delete(), 5000));
+      await GuildConfig.findOneAndUpdate({ guildId }, { $set: { logChannelId: targetChannel.id, updatedAt: new Date() } }, { upsert: true });
+      invalidateCache(guildId);
+      return message.reply(`✅ Log channel set to <#${targetChannel.id}>.`);
+    }
+    return message.reply(CONFIG_HELP);
+  }
+
   return message.reply(CONFIG_HELP);
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  !toggle — Manage Server OR configRole
+//  !toggle
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function handleToggle(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
     return message.reply("ma3andekch permission. 9arra9 badmin bch ta5ou el access.")
@@ -585,12 +597,387 @@ async function ensureMember(guildMember) {
   );
 }
 
-// ─── Events ───────────────────────────────────────────────────────────────────
-client.once("ready", () => console.log(`🤖 Logged in as ${client.user.tag}`));
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ███████╗██╗   ██╗███████╗███╗   ██╗████████╗    ██╗      ██████╗  ██████╗ ███████╗
+//  ██╔════╝██║   ██║██╔════╝████╗  ██║╚══██╔══╝    ██║     ██╔═══██╗██╔════╝ ██╔════╝
+//  █████╗  ██║   ██║█████╗  ██╔██╗ ██║   ██║       ██║     ██║   ██║██║  ███╗███████╗
+//  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██║╚██╗██║   ██║       ██║     ██║   ██║██║   ██║╚════██║
+//  ███████╗ ╚████╔╝ ███████╗██║ ╚████║   ██║        ███████╗╚██████╔╝╚██████╔╝███████║
+//  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝  ╚═╝         ╚══════╝ ╚═════╝  ╚═════╝ ╚══════╝
+// ═══════════════════════════════════════════════════════════════════════════════
 
+// ── Member Join ───────────────────────────────────────────────────────────────
 client.on("guildMemberAdd", async (member) => {
-  try { await ensureMember(member); }
-  catch (err) { console.error("guildMemberAdd error:", err); }
+  try { await ensureMember(member); } catch (err) { console.error("guildMemberAdd DB error:", err); }
+
+  sendLog(member.guild, {
+    color: Colors.join,
+    emoji: "📥",
+    title: "Member Joined",
+    fields: [
+      { name: "User",       value: `${member.user} (${member.user.tag})`, inline: true },
+      { name: "Account Age", value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: "User ID",    value: member.user.id, inline: true },
+      { name: "Time",       value: timestamp(), inline: true },
+    ],
+    footer: `Member count: ${member.guild.memberCount}`,
+  });
+});
+
+// ── Member Leave / Kick ───────────────────────────────────────────────────────
+client.on("guildMemberRemove", async (member) => {
+  // Wait briefly so the audit log has time to populate
+  await new Promise((r) => setTimeout(r, 1500));
+
+  let kickReason = null, kickExecutor = null;
+  try {
+    const auditLogs = await member.guild.fetchAuditLogs({ type: AuditLogEvent.MemberKick, limit: 1 });
+    const entry = auditLogs.entries.first();
+    if (entry && entry.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
+      kickReason   = entry.reason ?? "No reason provided";
+      kickExecutor = entry.executor;
+    }
+  } catch { /* audit log unavailable */ }
+
+  if (kickExecutor) {
+    // It was a kick
+    sendLog(member.guild, {
+      color: Colors.error,
+      emoji: "👢",
+      title: "Member Kicked",
+      fields: [
+        { name: "User",      value: `${member.user.tag}`, inline: true },
+        { name: "User ID",   value: member.user.id, inline: true },
+        { name: "Kicked By", value: `${kickExecutor}`, inline: true },
+        { name: "Reason",    value: kickReason, inline: false },
+        { name: "Time",      value: timestamp(), inline: true },
+      ],
+    });
+  } else {
+    // Voluntary leave
+    sendLog(member.guild, {
+      color: Colors.leave,
+      emoji: "📤",
+      title: "Member Left",
+      fields: [
+        { name: "User",    value: `${member.user.tag}`, inline: true },
+        { name: "User ID", value: member.user.id, inline: true },
+        { name: "Joined",  value: member.joinedAt ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : "Unknown", inline: true },
+        { name: "Time",    value: timestamp(), inline: true },
+      ],
+      footer: `Member count: ${member.guild.memberCount}`,
+    });
+  }
+});
+
+// ── Ban ───────────────────────────────────────────────────────────────────────
+client.on("guildBanAdd", async (ban) => {
+  await new Promise((r) => setTimeout(r, 1000));
+  let reason = ban.reason ?? "No reason provided", executor = null;
+  try {
+    const auditLogs = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 1 });
+    const entry = auditLogs.entries.first();
+    if (entry && entry.target?.id === ban.user.id) {
+      reason   = entry.reason ?? reason;
+      executor = entry.executor;
+    }
+  } catch { }
+
+  sendLog(ban.guild, {
+    color: Colors.ban,
+    emoji: "🔨",
+    title: "Member Banned",
+    fields: [
+      { name: "User",    value: `${ban.user.tag}`, inline: true },
+      { name: "User ID", value: ban.user.id, inline: true },
+      { name: "Banned By", value: executor ? `${executor}` : "Unknown", inline: true },
+      { name: "Reason",  value: reason },
+      { name: "Time",    value: timestamp(), inline: true },
+    ],
+  });
+});
+
+// ── Unban ─────────────────────────────────────────────────────────────────────
+client.on("guildBanRemove", async (ban) => {
+  await new Promise((r) => setTimeout(r, 1000));
+  let executor = null;
+  try {
+    const auditLogs = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanRemove, limit: 1 });
+    const entry = auditLogs.entries.first();
+    if (entry && entry.target?.id === ban.user.id) executor = entry.executor;
+  } catch { }
+
+  sendLog(ban.guild, {
+    color: Colors.unban,
+    emoji: "✅",
+    title: "Member Unbanned",
+    fields: [
+      { name: "User",       value: `${ban.user.tag}`, inline: true },
+      { name: "User ID",    value: ban.user.id, inline: true },
+      { name: "Unbanned By", value: executor ? `${executor}` : "Unknown", inline: true },
+      { name: "Time",       value: timestamp(), inline: true },
+    ],
+  });
+});
+
+// ── Timeout / Untimeout ───────────────────────────────────────────────────────
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  // ── Timeout applied ──────────────────────────────────────────────────────
+  if (!oldMember.communicationDisabledUntil && newMember.communicationDisabledUntil) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let reason = "No reason provided", executor = null;
+    try {
+      const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
+        e.changes?.some((c) => c.key === "communication_disabled_until"));
+      if (entry) { reason = entry.reason ?? reason; executor = entry.executor; }
+    } catch { }
+
+    sendLog(newMember.guild, {
+      color: Colors.timeout,
+      emoji: "⏱️",
+      title: "Member Timed Out",
+      fields: [
+        { name: "User",       value: `${newMember.user.tag}`, inline: true },
+        { name: "User ID",    value: newMember.user.id, inline: true },
+        { name: "Timed Out By", value: executor ? `${executor}` : "Unknown", inline: true },
+        { name: "Until",      value: `<t:${Math.floor(newMember.communicationDisabledUntilTimestamp / 1000)}:F>`, inline: true },
+        { name: "Reason",     value: reason },
+        { name: "Time",       value: timestamp(), inline: true },
+      ],
+    });
+  }
+
+  // ── Timeout removed ──────────────────────────────────────────────────────
+  if (oldMember.communicationDisabledUntil && !newMember.communicationDisabledUntil) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let executor = null;
+    try {
+      const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
+        e.changes?.some((c) => c.key === "communication_disabled_until"));
+      if (entry) executor = entry.executor;
+    } catch { }
+
+    sendLog(newMember.guild, {
+      color: Colors.ok,
+      emoji: "🔓",
+      title: "Member Untimeout",
+      fields: [
+        { name: "User",         value: `${newMember.user.tag}`, inline: true },
+        { name: "User ID",      value: newMember.user.id, inline: true },
+        { name: "Removed By",   value: executor ? `${executor}` : "Unknown / expired", inline: true },
+        { name: "Time",         value: timestamp(), inline: true },
+      ],
+    });
+  }
+
+  // ── Nickname changed ──────────────────────────────────────────────────────
+  if (oldMember.nickname !== newMember.nickname) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let executor = null;
+    try {
+      const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
+        e.changes?.some((c) => c.key === "nick"));
+      if (entry) executor = entry.executor;
+    } catch { }
+
+    sendLog(newMember.guild, {
+      color: Colors.nick,
+      emoji: "✏️",
+      title: "Nickname Changed",
+      fields: [
+        { name: "User",       value: `${newMember.user.tag}`, inline: true },
+        { name: "User ID",    value: newMember.user.id, inline: true },
+        { name: "Changed By", value: executor ? `${executor}` : "Self", inline: true },
+        { name: "Old Nick",   value: oldMember.nickname ?? "*none*", inline: true },
+        { name: "New Nick",   value: newMember.nickname ?? "*none*", inline: true },
+        { name: "Time",       value: timestamp(), inline: true },
+      ],
+    });
+  }
+});
+
+// ── Message Deleted ───────────────────────────────────────────────────────────
+client.on("messageDelete", async (message) => {
+  // Ignore partial messages with no content, bot messages, and DMs
+  if (!message.guild || message.author?.bot) return;
+  if (!message.content && !message.attachments?.size) return;
+
+  await new Promise((r) => setTimeout(r, 1000));
+  let executor = null;
+  try {
+    const auditLogs = await message.guild.fetchAuditLogs({ type: AuditLogEvent.MessageDelete, limit: 1 });
+    const entry = auditLogs.entries.first();
+    // Only credit the executor if the delete was very recent and matches channel + author
+    if (
+      entry &&
+      entry.target?.id === message.author?.id &&
+      entry.extra?.channel?.id === message.channel.id &&
+      Date.now() - entry.createdTimestamp < 5000
+    ) {
+      executor = entry.executor;
+    }
+  } catch { }
+
+  const attachmentList = message.attachments?.size
+    ? [...message.attachments.values()].map((a) => `[${a.name}](${a.url})`).join(", ")
+    : null;
+
+  const fields = [
+    { name: "Author",  value: message.author ? `${message.author} (${message.author.tag})` : "Unknown", inline: true },
+    { name: "Channel", value: `${message.channel}`, inline: true },
+    { name: "Deleted By", value: executor ? `${executor}` : "Author / unknown", inline: true },
+  ];
+  if (message.content) fields.push({ name: "Content", value: `\`\`\`${message.content.slice(0, 900)}\`\`\`` });
+  if (attachmentList) fields.push({ name: "Attachments", value: attachmentList });
+  fields.push({ name: "Time", value: timestamp(), inline: true });
+
+  sendLog(message.guild, {
+    color: Colors.delete,
+    emoji: "🗑️",
+    title: "Message Deleted",
+    fields,
+  });
+});
+
+// ── Message Edited ────────────────────────────────────────────────────────────
+client.on("messageUpdate", async (oldMessage, newMessage) => {
+  // ─ Bad-word check on edited messages (existing logic) ─────────────────────
+  if (newMessage.author?.bot || !newMessage.guild) return;
+  if (!features.badwords || !newMessage.content) return;
+
+  const cfg      = await getConfig(newMessage.guild.id);
+  const isExempt = newMessage.member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
+
+  if (!isExempt && cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(newMessage.channel.id)) {
+    // outside monitored channels — only log the edit, don't moderate
+    if (oldMessage.content && oldMessage.content !== newMessage.content) {
+      sendLog(newMessage.guild, {
+        color: Colors.edit,
+        emoji: "✏️",
+        title: "Message Edited",
+        fields: [
+          { name: "Author",  value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
+          { name: "Channel", value: `${newMessage.channel}`, inline: true },
+          { name: "Before",  value: `\`\`\`${(oldMessage.content || "*empty*").slice(0, 400)}\`\`\`` },
+          { name: "After",   value: `\`\`\`${newMessage.content.slice(0, 400)}\`\`\`` },
+          { name: "Time",    value: timestamp(), inline: true },
+        ],
+        footer: "Message link: " + newMessage.url,
+      });
+    }
+    return;
+  }
+
+  const allContent = newMessage.content.toLowerCase() + " " + getForwardedContent(newMessage);
+
+  if (!isExempt && isBadContent(allContent)) {
+    newMessage.delete().catch(() => {});
+
+    let result = { action: "warn", warns: 0, timeouts: 0, timeoutUntil: null };
+    try { result = await handleOffence(newMessage, newMessage.content); }
+    catch (err) { console.error("handleOffence (edit) error:", err); }
+
+    if (result.action === "warn") {
+      newMessage.channel
+        .send(`${newMessage.author}, fe9t bik ta3mel fi edit — arka7 takel ban rak .`)
+        .then((m) => setTimeout(() => m.delete(), 5000));
+    }
+
+    if (features.logs) {
+      const actionEmoji = { warn: "⚠️", timeout: "⏱️", ban: "🔨" }[result.action];
+      const actionColor = { warn: Colors.warn, timeout: Colors.timeout, ban: Colors.ban }[result.action];
+      sendLog(newMessage.guild, {
+        color: actionColor, emoji: actionEmoji,
+        title: `Bad Word in Edit — ${result.action.toUpperCase()}`,
+        fields: [
+          { name: "User",    value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
+          { name: "Channel", value: `${newMessage.channel}`, inline: true },
+          { name: "Action",  value: result.action.toUpperCase(), inline: true },
+          { name: "Warns",   value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
+          { name: "Timeouts",value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
+          { name: "Edited Content", value: `\`\`\`${newMessage.content.slice(0, 300)}\`\`\`` },
+          { name: "Time",    value: timestamp(), inline: true },
+        ],
+        footer: "Message deleted automatically",
+      });
+    }
+    return;
+  }
+
+  // ─ Log clean edits ────────────────────────────────────────────────────────
+  if (oldMessage.content && oldMessage.content !== newMessage.content && features.logs) {
+    sendLog(newMessage.guild, {
+      color: Colors.edit,
+      emoji: "✏️",
+      title: "Message Edited",
+      fields: [
+        { name: "Author",  value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
+        { name: "Channel", value: `${newMessage.channel}`, inline: true },
+        { name: "Before",  value: `\`\`\`${(oldMessage.content || "*empty*").slice(0, 400)}\`\`\`` },
+        { name: "After",   value: `\`\`\`${newMessage.content.slice(0, 400)}\`\`\`` },
+        { name: "Time",    value: timestamp(), inline: true },
+      ],
+      footer: "Message link: " + newMessage.url,
+    });
+  }
+});
+
+// ── Voice Channel Activity ────────────────────────────────────────────────────
+client.on("voiceStateUpdate", (oldState, newState) => {
+  const guild  = newState.guild ?? oldState.guild;
+  const user   = newState.member?.user ?? oldState.member?.user;
+  if (!guild || !user || user.bot) return;
+
+  const oldCh = oldState.channel;
+  const newCh = newState.channel;
+
+  // Join
+  if (!oldCh && newCh) {
+    sendLog(guild, {
+      color: Colors.voice,
+      emoji: "🔊",
+      title: "Voice Channel Joined",
+      fields: [
+        { name: "User",    value: `${user} (${user.tag})`, inline: true },
+        { name: "Channel", value: newCh.name, inline: true },
+        { name: "Time",    value: timestamp(), inline: true },
+      ],
+    });
+    return;
+  }
+
+  // Leave
+  if (oldCh && !newCh) {
+    sendLog(guild, {
+      color: Colors.leave,
+      emoji: "🔇",
+      title: "Voice Channel Left",
+      fields: [
+        { name: "User",    value: `${user} (${user.tag})`, inline: true },
+        { name: "Channel", value: oldCh.name, inline: true },
+        { name: "Time",    value: timestamp(), inline: true },
+      ],
+    });
+    return;
+  }
+
+  // Move
+  if (oldCh && newCh && oldCh.id !== newCh.id) {
+    sendLog(guild, {
+      color: Colors.voice,
+      emoji: "🔀",
+      title: "Voice Channel Moved",
+      fields: [
+        { name: "User",    value: `${user} (${user.tag})`, inline: true },
+        { name: "From",    value: oldCh.name, inline: true },
+        { name: "To",      value: newCh.name, inline: true },
+        { name: "Time",    value: timestamp(), inline: true },
+      ],
+    });
+  }
 });
 
 // ── Main message handler ──────────────────────────────────────────────────────
@@ -601,10 +988,8 @@ client.on("messageCreate", async (message) => {
   const content    = message.content.toLowerCase();
   const allContent = content + " " + getForwardedContent(message);
 
-  // ── Load guild config ──────────────────────────────────────────────────────
   const cfg = await getConfig(guild.id);
 
-  // ── Bot commands — always allowed regardless of channel restrictions ─────────
   if (content.startsWith("!admin")) {
     await handleAdmin(message, message.content.trim().split(/\s+/).slice(1));
     return;
@@ -618,14 +1003,10 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ── Channel restriction — ignore messages outside allowed channels ──────────
-  // If allowedChannels is empty → no restriction (bot works everywhere)
   if (cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(channel.id)) return;
 
-  // ── Role exemption — skip moderation for exempt roles ─────────────────────
   const isExempt = member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
-  // ── Bad word detection (skipped for exempt roles) ─────────────────────────
   if (features.badwords && !isExempt) {
     const recentMessages = getRecentMessages(message.author.id, message);
 
@@ -650,62 +1031,16 @@ client.on("messageCreate", async (message) => {
         if (result.timeoutUntil) fields.push({ name: "Muted Until", value: `<t:${Math.floor(result.timeoutUntil / 1000)}:F>`, inline: true });
         fields.push({ name: "Content", value: `\`\`\`${message.content.slice(0, 300)}\`\`\`` });
         fields.push({ name: "Time",    value: timestamp(), inline: true });
-        sendLog(guild, { color: actionColor, emoji: actionEmoji, title: `Bad Word — ${result.action.toUpperCase()}`, fields, footer: "Warns reset after 30 min • Timeouts reset after 2 h" });
+        sendLog(guild, { color: actionColor, emoji: actionEmoji, title: `Bad Word — ${result.action.toUpperCase()}`, fields, footer: "Warns reset after 30 min • Timeouts reset after 2 h" }, cfg.logChannelId);
       }
       return;
     }
   }
 
-  // ── Track clean message ───────────────────────────────────────────────────
   try { await trackMessage(message); }
   catch (err) { console.error("trackMessage error:", err); }
 });
 
-// ── Edit handler ──────────────────────────────────────────────────────────────
-client.on("messageUpdate", async (oldMessage, newMessage) => {
-  if (newMessage.author?.bot || !newMessage.guild) return;
-  if (!features.badwords || !newMessage.content) return;
-
-  const cfg      = await getConfig(newMessage.guild.id);
-  const isExempt = newMessage.member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
-  if (isExempt) return;
-
-  if (cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(newMessage.channel.id)) return;
-
-  const allContent = newMessage.content.toLowerCase() + " " + getForwardedContent(newMessage);
-  if (!isBadContent(allContent)) return;
-
-  newMessage.delete().catch(() => {});
-
-  let result = { action: "warn", warns: 0, timeouts: 0, timeoutUntil: null };
-  try { result = await handleOffence(newMessage, newMessage.content); }
-  catch (err) { console.error("handleOffence (edit) error:", err); }
-
-  if (result.action === "warn") {
-    newMessage.channel
-      .send(`${newMessage.author}, fe9t bik ta3mel fi edit — arka7 takel ban rak .`)
-      .then((m) => setTimeout(() => m.delete(), 5000));
-  }
-
-  if (features.logs) {
-    const actionEmoji = { warn: "⚠️", timeout: "⏱️", ban: "🔨" }[result.action];
-    const actionColor = { warn: Colors.warn, timeout: Colors.timeout, ban: Colors.ban }[result.action];
-    sendLog(newMessage.guild, {
-      color: actionColor, emoji: actionEmoji,
-      title: `Bad Word in Edit — ${result.action.toUpperCase()}`,
-      fields: [
-        { name: "User",    value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
-        { name: "Channel", value: `${newMessage.channel}`, inline: true },
-        { name: "Action",  value: result.action.toUpperCase(), inline: true },
-        { name: "Warns",   value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
-        { name: "Timeouts",value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
-        { name: "Edited Content", value: `\`\`\`${newMessage.content.slice(0, 300)}\`\`\`` },
-        { name: "Time",    value: timestamp(), inline: true },
-      ],
-      footer: "Message deleted automatically",
-    });
-  }
-});
-
 // ─── Login ────────────────────────────────────────────────────────────────────
+client.once("ready", () => console.log(`🤖 Logged in as ${client.user.tag}`));
 client.login(process.env.TOKEN).catch((err) => console.error("Login error:", err));
