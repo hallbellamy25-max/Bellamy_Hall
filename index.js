@@ -34,6 +34,10 @@ const guildConfigSchema = new mongoose.Schema({
   // Add admin / mod / owner roles here.
   exemptRoles: { type: [String], default: [] },
 
+  // Role IDs allowed to use !config and !toggle.
+  // Only someone with Manage Server can add/remove these via !admin.
+  configRoles: { type: [String], default: [] },
+
   updatedAt: { type: Date, default: Date.now },
 });
 const GuildConfig = mongoose.model("GuildConfig", guildConfigSchema);
@@ -50,6 +54,7 @@ async function getConfig(guildId) {
   const cfg = {
     allowedChannels: new Set(doc.allowedChannels),
     exemptRoles:     new Set(doc.exemptRoles),
+    configRoles:     new Set(doc.configRoles),
   };
   configCache.set(guildId, cfg);
   return cfg;
@@ -211,170 +216,269 @@ function timestamp() { return `<t:${Math.floor(Date.now() / 1000)}:T>`; }
 const Colors = { warn: "#FEE75C", timeout: "#E67E22", ban: "#FF0000", info: "#5865F2", ok: "#57F287", error: "#ED4245" };
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  !config command — manage allowed channels & exempt roles
+//  PERMISSION SYSTEM
 //
-//  Usage (must have Manage Guild permission):
-//
-//    !config channel add #channel-name   — add a channel to the allowed list
-//    !config channel remove #channel     — remove it
-//    !config channel list                — show all allowed channels
-//    !config channel clear               — allow all channels again
-//
-//    !config role add @RoleName          — add an exempt role
-//    !config role remove @RoleName       — remove an exempt role
-//    !config role list                   — show all exempt roles
-//    !config role clear                  — clear all exempt roles
-//
-//    !config show                        — show full current config
+//  !admin  → Manage Server only → grants/revokes roles access to !config & !toggle
+//  !config → Manage Server  OR  roles added via !admin
+//  !toggle → Manage Server  OR  roles added via !admin
 // ══════════════════════════════════════════════════════════════════════════════
 
+function hasManageGuild(member) {
+  return member.permissions.has(PermissionFlagsBits.ManageGuild);
+}
+
+// Returns true if member has Manage Server OR one of the configRoles
+function hasConfigAccess(member, cfg) {
+  return (
+    hasManageGuild(member) ||
+    member.roles.cache.some((r) => cfg.configRoles.has(r.id))
+  );
+}
+
+// ── Help strings ──────────────────────────────────────────────────────────────
+
+const ADMIN_HELP =
+  "**!admin** *(Manage Server only)*\n\n" +
+  "`!admin role add @role` — give a role access to !config and !toggle\n" +
+  "`!admin role remove @role` — revoke that access\n" +
+  "`!admin role list` — show which roles can use !config and !toggle\n" +
+  "`!admin show` — show full server channels & roles with their IDs";
+
 const CONFIG_HELP =
-  "**!config commands:**\n" +
-  "`!config channel add #channel` — bot will only watch listed channels (empty = all)\n" +
-  "`!config channel remove #channel` — stop watching a channel\n" +
-  "`!config channel list` — show watched channels\n" +
-  "`!config channel clear` — watch all channels again\n\n" +
-  "`!config role add @role` — exempt a role from warns\n" +
+  "**!config** *(admin role or Manage Server required)*\n\n" +
+  "**Channels — which channels the bot reads & moderates:**\n" +
+  "`!config channel add #channel` — add a channel (empty list = all channels)\n" +
+  "`!config channel remove #channel` — remove a channel\n" +
+  "`!config channel list` — show active channels\n" +
+  "`!config channel clear` — remove all restrictions\n\n" +
+  "**Exempt roles — skip bad-word detection entirely:**\n" +
+  "`!config role add @role` — exempt a role\n" +
   "`!config role remove @role` — remove exemption\n" +
   "`!config role list` — show exempt roles\n" +
   "`!config role clear` — clear all exemptions\n\n" +
-  "`!config show` — show everything";
+  "`!config show` — show current config";
 
-async function handleConfig(message, args) {
-  // Require Manage Guild permission
-  if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    return message.reply("ma3andekch permission .").then((m) => setTimeout(() => m.delete(), 4000));
+const TOGGLE_HELP =
+  "**!toggle** *(admin role or Manage Server required)*\n" +
+  "`!toggle badwords` — turn bad-word detection on/off\n" +
+  "`!toggle logs` — turn mod-log embeds on/off\n" +
+  "`!toggle status` — show current feature states";
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  !admin — only Manage Server can run this
+//  Controls which roles get access to !config and !toggle
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function handleAdmin(message, args) {
+  if (!hasManageGuild(message.member)) {
+    return message.reply("ma3andekch permission. lazem **Manage Server** bch testa3mel !admin.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
-  const sub    = args[0]?.toLowerCase(); // "channel" | "role" | "show"
-  const action = args[1]?.toLowerCase(); // "add" | "remove" | "list" | "clear"
+  const sub     = args[0]?.toLowerCase(); // "role" | "show"
+  const action  = args[1]?.toLowerCase(); // "add" | "remove" | "list"
   const guildId = message.guild.id;
 
-  // ── !config show ────────────────────────────────────────────────────────────
+  // ── !admin show — lists all channels + roles with IDs ─────────────────────
+  if (sub === "show" || !sub) {
+    const doc = await GuildConfig.findOne({ guildId }) ?? { configRoles: [] };
+
+    const configRoleList = doc.configRoles?.length
+      ? doc.configRoles.map((id) => `<@&${id}>`).join(", ")
+      : "None — only Manage Server users can use !config and !toggle";
+
+    const allChannels = message.guild.channels.cache
+      .filter((c) => c.type === ChannelType.GuildText)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((c) => `#${c.name} — \`${c.id}\``)
+      .join("\n") || "none";
+
+    const allRoles = message.guild.roles.cache
+      .filter((r) => !r.managed && r.id !== message.guild.id)
+      .sort((a, b) => b.position - a.position)
+      .map((r) => `@${r.name} — \`${r.id}\``)
+      .join("\n") || "none";
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.info)
+      .setTitle("🔐  Admin Panel")
+      .addFields(
+        { name: "🔧 Roles with !config & !toggle access", value: configRoleList },
+        { name: "📋 All text channels (name — ID)", value: allChannels.slice(0, 1020) },
+        { name: "🏷️ All roles (name — ID)", value: allRoles.slice(0, 1020) },
+      )
+      .setFooter({ text: "Use these IDs with !config channel add / !config role add" })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [embed] });
+  }
+
+  // ── !admin role ────────────────────────────────────────────────────────────
+  if (sub === "role") {
+    if (action === "list") {
+      const doc = await GuildConfig.findOne({ guildId }) ?? { configRoles: [] };
+      const list = doc.configRoles?.length
+        ? doc.configRoles.map((id) => `<@&${id}>`).join(", ")
+        : "None.";
+      return message.reply(`🔧 Roles with !config & !toggle access: ${list}`);
+    }
+
+    const targetRole = message.mentions.roles.first();
+    if (!targetRole)
+      return message.reply("Mentionni el role. ex: `!admin role add @Admin`")
+        .then((m) => setTimeout(() => m.delete(), 5000));
+
+    if (action === "add") {
+      await GuildConfig.findOneAndUpdate(
+        { guildId },
+        { $addToSet: { configRoles: targetRole.id }, $set: { updatedAt: new Date() } },
+        { upsert: true }
+      );
+      invalidateCache(guildId);
+      return message.reply(`✅ <@&${targetRole.id}> can now use \`!config\` and \`!toggle\`.`);
+    }
+
+    if (action === "remove") {
+      await GuildConfig.findOneAndUpdate(
+        { guildId },
+        { $pull: { configRoles: targetRole.id }, $set: { updatedAt: new Date() } }
+      );
+      invalidateCache(guildId);
+      return message.reply(`✅ <@&${targetRole.id}> no longer has access to \`!config\` and \`!toggle\`.`);
+    }
+
+    return message.reply(ADMIN_HELP);
+  }
+
+  return message.reply(ADMIN_HELP);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  !config — Manage Server OR configRole
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function handleConfig(message, args, cfg) {
+  if (!hasConfigAccess(message.member, cfg)) {
+    return message.reply("ma3andekch permission. 9arra9 badmin bch ta5ou el access.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  }
+
+  const sub     = args[0]?.toLowerCase();
+  const action  = args[1]?.toLowerCase();
+  const guildId = message.guild.id;
+
+  // ── !config show ──────────────────────────────────────────────────────────
   if (sub === "show" || !sub) {
     const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [], exemptRoles: [] };
 
     const chList = doc.allowedChannels.length
       ? doc.allowedChannels.map((id) => `<#${id}>`).join(", ")
       : "All channels (no restriction)";
-
-    const roleList = doc.exemptRoles.length
+    const exemptList = doc.exemptRoles.length
       ? doc.exemptRoles.map((id) => `<@&${id}>`).join(", ")
       : "None";
 
-    // Also list every channel and role in the server for reference
-    const allChannels = message.guild.channels.cache
-      .filter((c) => c.type === ChannelType.GuildText)
-      .map((c) => `${c.name} — \`${c.id}\``)
-      .join("\n") || "none";
-
-    const allRoles = message.guild.roles.cache
-      .filter((r) => !r.managed && r.id !== message.guild.id)
-      .sort((a, b) => b.position - a.position)
-      .map((r) => `${r.name} — \`${r.id}\``)
-      .join("\n") || "none";
-
     const embed = new EmbedBuilder()
       .setColor(Colors.info)
-      .setTitle("⚙️  Bot Configuration")
+      .setTitle("⚙️  Bot Config")
       .addFields(
-        { name: "✅ Allowed channels (bot active in)", value: chList },
-        { name: "🛡️ Exempt roles (no warns)", value: roleList },
-        { name: "📋 All text channels in this server", value: allChannels.slice(0, 1020) },
-        { name: "🏷️ All roles in this server", value: allRoles.slice(0, 1020) },
+        { name: "✅ Active channels (bot reads & moderates)", value: chList },
+        { name: "🛡️ Exempt roles (no warns/detection)", value: exemptList },
       )
+      .setFooter({ text: "Use !admin show to see all channel & role IDs" })
       .setTimestamp();
 
     return message.channel.send({ embeds: [embed] });
   }
 
-  // ── !config channel ─────────────────────────────────────────────────────────
+  // ── !config channel ────────────────────────────────────────────────────────
   if (sub === "channel") {
     if (action === "list") {
       const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [] };
       const list = doc.allowedChannels.length
         ? doc.allowedChannels.map((id) => `<#${id}>`).join(", ")
-        : "No restriction — bot is active in all channels.";
-      return message.reply(`📋 Allowed channels: ${list}`);
+        : "No restriction — bot active in all channels.";
+      return message.reply(`📋 Active channels: ${list}`);
     }
-
     if (action === "clear") {
       await GuildConfig.findOneAndUpdate({ guildId }, { $set: { allowedChannels: [], updatedAt: new Date() } }, { upsert: true });
       invalidateCache(guildId);
-      return message.reply("✅ Channel restriction cleared — bot is now active in all channels.");
+      return message.reply("✅ Channel restriction cleared — bot active in all channels.");
     }
-
     const targetChannel = message.mentions.channels.first();
-    if (!targetChannel) {
-      return message.reply("Mentionni el channel. ex: `!config channel add #general`").then((m) => setTimeout(() => m.delete(), 5000));
-    }
-
+    if (!targetChannel)
+      return message.reply("Mentionni el channel. ex: `!config channel add #general`")
+        .then((m) => setTimeout(() => m.delete(), 5000));
     if (action === "add") {
-      await GuildConfig.findOneAndUpdate(
-        { guildId },
-        { $addToSet: { allowedChannels: targetChannel.id }, $set: { updatedAt: new Date() } },
-        { upsert: true }
-      );
+      await GuildConfig.findOneAndUpdate({ guildId }, { $addToSet: { allowedChannels: targetChannel.id }, $set: { updatedAt: new Date() } }, { upsert: true });
       invalidateCache(guildId);
-      return message.reply(`✅ <#${targetChannel.id}> added to allowed channels.`);
+      return message.reply(`✅ <#${targetChannel.id}> added — bot now active there.`);
     }
-
     if (action === "remove") {
-      await GuildConfig.findOneAndUpdate(
-        { guildId },
-        { $pull: { allowedChannels: targetChannel.id }, $set: { updatedAt: new Date() } }
-      );
+      await GuildConfig.findOneAndUpdate({ guildId }, { $pull: { allowedChannels: targetChannel.id }, $set: { updatedAt: new Date() } });
       invalidateCache(guildId);
-      return message.reply(`✅ <#${targetChannel.id}> removed from allowed channels.`);
+      return message.reply(`✅ <#${targetChannel.id}> removed.`);
     }
-
     return message.reply(CONFIG_HELP);
   }
 
-  // ── !config role ─────────────────────────────────────────────────────────────
+  // ── !config role ───────────────────────────────────────────────────────────
   if (sub === "role") {
+    const targetRole = message.mentions.roles.first();
+
     if (action === "list") {
       const doc = await GuildConfig.findOne({ guildId }) ?? { exemptRoles: [] };
-      const list = doc.exemptRoles.length
-        ? doc.exemptRoles.map((id) => `<@&${id}>`).join(", ")
-        : "No roles are exempt.";
+      const list = doc.exemptRoles.length ? doc.exemptRoles.map((id) => `<@&${id}>`).join(", ") : "None.";
       return message.reply(`🛡️ Exempt roles: ${list}`);
     }
-
     if (action === "clear") {
       await GuildConfig.findOneAndUpdate({ guildId }, { $set: { exemptRoles: [], updatedAt: new Date() } }, { upsert: true });
       invalidateCache(guildId);
-      return message.reply("✅ All role exemptions cleared.");
+      return message.reply("✅ All exempt roles cleared.");
     }
-
-    const targetRole = message.mentions.roles.first();
-    if (!targetRole) {
-      return message.reply("Mentionni el role. ex: `!config role add @Admin`").then((m) => setTimeout(() => m.delete(), 5000));
-    }
-
     if (action === "add") {
-      await GuildConfig.findOneAndUpdate(
-        { guildId },
-        { $addToSet: { exemptRoles: targetRole.id }, $set: { updatedAt: new Date() } },
-        { upsert: true }
-      );
+      if (!targetRole) return message.reply("Mentionni el role. ex: `!config role add @Mod`").then((m) => setTimeout(() => m.delete(), 5000));
+      await GuildConfig.findOneAndUpdate({ guildId }, { $addToSet: { exemptRoles: targetRole.id }, $set: { updatedAt: new Date() } }, { upsert: true });
       invalidateCache(guildId);
-      return message.reply(`✅ <@&${targetRole.id}> is now exempt from warns.`);
+      return message.reply(`✅ <@&${targetRole.id}> is now exempt from bad-word detection.`);
     }
-
     if (action === "remove") {
-      await GuildConfig.findOneAndUpdate(
-        { guildId },
-        { $pull: { exemptRoles: targetRole.id }, $set: { updatedAt: new Date() } }
-      );
+      if (!targetRole) return message.reply("Mentionni el role. ex: `!config role remove @Mod`").then((m) => setTimeout(() => m.delete(), 5000));
+      await GuildConfig.findOneAndUpdate({ guildId }, { $pull: { exemptRoles: targetRole.id }, $set: { updatedAt: new Date() } });
       invalidateCache(guildId);
-      return message.reply(`✅ <@&${targetRole.id}> is no longer exempt.`);
+      return message.reply(`✅ <@&${targetRole.id}> exemption removed.`);
     }
-
     return message.reply(CONFIG_HELP);
   }
 
   return message.reply(CONFIG_HELP);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  !toggle — Manage Server OR configRole
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function handleToggle(message, args, cfg) {
+  if (!hasConfigAccess(message.member, cfg)) {
+    return message.reply("ma3andekch permission. 9arra9 badmin bch ta5ou el access.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  }
+
+  const feature = args[0]?.toLowerCase();
+
+  if (feature === "status" || !feature) {
+    return message.reply(
+      "**Feature status:**\n" +
+      Object.entries(features).map(([k, v]) => `• \`${k}\`: ${v ? "🟢 on" : "🔴 off"}`).join("\n")
+    );
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(features, feature)) {
+    return message.reply(TOGGLE_HELP);
+  }
+
+  features[feature] = !features[feature];
+  message.reply(`✅ \`${feature}\` is now ${features[feature] ? "🟢 on" : "🔴 off"}`);
 }
 
 // ─── Offence handler ──────────────────────────────────────────────────────────
@@ -408,7 +512,7 @@ async function handleOffence(message, offendingContent) {
           $push: { badWordHistory: { $each: [{ content: offendingContent.slice(0, 500), channelId: channel.id, action: "ban", timestamp: now }], $slice: -50 } },
         }
       );
-      author.send("koul ban . 3 timeouts w mazelt ma fhemtech ro7ek . bye.").catch(() => {});
+      author.send("kool ban. 3 timeouts w mazelt ma fhemtech. bye.").catch(() => {});
       await guild.members.ban(author.id, { reason: "3 timeouts — repeated bad word offences" }).catch(console.error);
 
     } else {
@@ -430,11 +534,11 @@ async function handleOffence(message, offendingContent) {
 
       const durationStr = msToHuman(duration);
       message.channel
-        .send(`⏱️ ${author} , 3 warns w mazelt mafhemtech — get muted **${durationStr}**. (timeout #${timeouts}/3)`)
+        .send(`⏱️ ${author} , 3 warns w mazelt mafhemtech ro7ek — get muted **${durationStr}**. (timeout #${timeouts}/3)`)
         .then((m) => setTimeout(() => m.delete(), 8000));
       author.send(
-        ` koul mute **${durationStr}** 5atrek kathart mel lklam el zayed.\n` +
-        `Timeout #${timeouts}/3 — el jey ykoun akbar. yezzi bla klam zayed 5irlek .`
+        ` you are muted **${durationStr}** na99es melklam ezayed.\n` +
+        `Timeout #${timeouts}/3 — eltimeout ejey ykoun akbar. arka7.`
       ).catch(() => {});
     }
 
@@ -450,7 +554,7 @@ async function handleOffence(message, offendingContent) {
     message.channel
       .send(
         `⚠️ ${author} , yezi bla klam zayed ! Warn **${warns}/${WARNS_BEFORE_TIMEOUT}** — ` +
-        `${left === 1 ? "warn 9adha w rak muted !" : `${left} warns bachich tmuted.`}`
+        `${left === 1 ? "warn o5ra rak takel mute !" : `${left} warns mazalou and you will get muted.`}`
       )
       .then((m) => setTimeout(() => m.delete(), 6000));
   }
@@ -500,10 +604,17 @@ client.on("messageCreate", async (message) => {
   // ── Load guild config ──────────────────────────────────────────────────────
   const cfg = await getConfig(guild.id);
 
-  // ── !config command (always allowed regardless of channel restrictions) ────
+  // ── Bot commands — always allowed regardless of channel restrictions ─────────
+  if (content.startsWith("!admin")) {
+    await handleAdmin(message, message.content.trim().split(/\s+/).slice(1));
+    return;
+  }
   if (content.startsWith("!config")) {
-    const args = message.content.trim().split(/\s+/).slice(1);
-    await handleConfig(message, args);
+    await handleConfig(message, message.content.trim().split(/\s+/).slice(1), cfg);
+    return;
+  }
+  if (content.startsWith("!toggle")) {
+    await handleToggle(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
 
