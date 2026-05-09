@@ -500,6 +500,67 @@ async function handleToggle(message, args, cfg) {
   message.reply(`✅ \`${feature}\` is now ${features[feature] ? "🟢 on" : "🔴 off"}`);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  !fassa5 [amount] — bulk delete messages (default 10, max 100)
+//  Requires: Manage Messages OR superuser
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function handleFassa5(message, args, cfg) {
+  const canUse = hasConfigAccess(message.member, cfg);
+
+  if (!canUse) {
+    return message.reply("ma3andekch permission. lazem **Manage Messages** bch testa3mel !fassa5.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  }
+
+  const amount = parseInt(args[0]);
+
+  if (!args[0]) {
+    return message.reply("ekteb el 3adad. ex: `!fassa5 50`")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  }
+
+  if (isNaN(amount) || amount < 1 || amount > 100) {
+    return message.reply("el 3adad lazem ykoun bin 1 w 100. ex: `!fassa5 50`")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  }
+
+  // Delete the command message first
+  await message.delete().catch(() => {});
+
+  // Discord only lets you bulk-delete messages newer than 14 days
+  const deleted = await message.channel.bulkDelete(amount, true).catch((err) => {
+    console.error("fassa5 bulkDelete error:", err);
+    return null;
+  });
+
+  if (!deleted) {
+    return message.channel
+      .send("❌ Ma9dartch namsah. taa9ad el bot 3andou **Manage Messages** permission.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+
+  const confirm = await message.channel.send(
+    `🗑️ Tmashah **${deleted.size}** message${deleted.size !== 1 ? "s" : ""} fi <#${message.channel.id}>.`
+  );
+  setTimeout(() => confirm.delete().catch(() => {}), 4000);
+
+  if (features.logs) {
+    const logChannelId = (await getConfig(message.guild.id)).logChannelId;
+    sendLog(message.guild, {
+      color: Colors.delete,
+      emoji: "🗑️",
+      title: "Bulk Delete (fassa5)",
+      fields: [
+        { name: "Moderator", value: `${message.author} (${message.author.tag})`, inline: true },
+        { name: "Channel",   value: `${message.channel}`, inline: true },
+        { name: "Deleted",   value: `${deleted.size} messages`, inline: true },
+        { name: "Time",      value: timestamp(), inline: true },
+      ],
+    }, logChannelId);
+  }
+}
+
 // ─── Offence handler ──────────────────────────────────────────────────────────
 async function handleOffence(message, offendingContent) {
   const { author, guild, channel } = message;
@@ -1005,10 +1066,11 @@ client.on("messageCreate", async (message) => {
     await handleConfig(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
-  if (content.startsWith("!toggle")) {
-    await handleToggle(message, message.content.trim().split(/\s+/).slice(1), cfg);
+  if (content.startsWith("!fassa5")) {
+    await handleFassa5(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
+
 
   if (cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(channel.id)) return;
 
