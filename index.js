@@ -466,6 +466,7 @@ async function handleConfig(message, args, cfg) {
   }
 
   return message.reply(CONFIG_HELP);
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  !toggle
