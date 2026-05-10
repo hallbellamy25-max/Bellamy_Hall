@@ -261,7 +261,7 @@ async function handleOwnerMention(message) {
 
     channel
       .send(
-        `⚠️ ${author} , matnajamch ta3mel mention lel owner ! Warn **${mentions}/${OWNER_MENTION_WARNS_BEFORE_TIMEOUT}** — ` +
+        `⚠️ ${author} , ta9der ma tmentionich el owner ! Warn **${mentions}/${OWNER_MENTION_WARNS_BEFORE_TIMEOUT}** — ` +
         `${left === 1
           ? "warn o5ra rak takel mute 10 min !"
           : `${left} warns mazalou w rak takel mute 10 min.`}`
@@ -356,7 +356,7 @@ function isBadInHistory(userId, content) {
 }
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
-const LOG_CHANNEL_NAME = "logs";
+const LOG_CHANNEL_NAME = "📊・brew-logs";
 
 async function getLogChannelId(guildId) {
   if (configCache.has(guildId)) return configCache.get(guildId).logChannelId ?? null;
@@ -679,6 +679,10 @@ async function handleConfig(message, args, cfg) {
   }
 
   return message.reply(CONFIG_HELP);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  !toggle
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleToggle(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
@@ -708,7 +712,7 @@ async function handleToggle(message, args, cfg) {
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleFassa5(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
-    return message.reply("ma3andekch permission. 9arra9 badmin bhech tnajjem tfassa5.")
+    return message.reply("ma3andekch permission. lazem **Manage Messages** bch testa3mel !fassa5.")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
@@ -719,7 +723,7 @@ async function handleFassa5(message, args, cfg) {
 
   const amount = parseInt(args[0]);
   if (isNaN(amount) || amount < 1 || amount > 100) {
-    return message.reply("e5tar number bin 1 w 100. ex: `!fassa5 50`")
+    return message.reply("el 3adad lazem ykoun bin 1 w 100. ex: `!fassa5 50`")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
@@ -732,7 +736,7 @@ async function handleFassa5(message, args, cfg) {
 
   if (!deleted) {
     return message.channel
-      .send("❌ najjamtech nfassa5. el bot 3andouch **Manage Messages** permission.")
+      .send("❌ Ma9dartch namsah. taa9ad el bot 3andou **Manage Messages** permission.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 
