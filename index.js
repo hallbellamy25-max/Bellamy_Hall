@@ -445,7 +445,6 @@ async function handleConfig(message, args, cfg) {
     return message.reply(CONFIG_HELP);
   }
 
-  // ── !config logs ───────────────────────────────────────────────────────────
   if (sub === "logs") {
     if (action === "show") {
       const doc = await GuildConfig.findOne({ guildId });
@@ -504,20 +503,17 @@ async function handleToggle(message, args, cfg) {
 //  !fassa5
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleFassa5(message, args, cfg) {
-  const canUse = hasConfigAccess(message.member, cfg);
-
-  if (!canUse) {
+  if (!hasConfigAccess(message.member, cfg)) {
     return message.reply("ma3andekch permission. lazem **Manage Messages** bch testa3mel !fassa5.")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
-
-  const amount = parseInt(args[0]);
 
   if (!args[0]) {
     return message.reply("ekteb el 3adad. ex: `!fassa5 50`")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
+  const amount = parseInt(args[0]);
   if (isNaN(amount) || amount < 1 || amount > 100) {
     return message.reply("el 3adad lazem ykoun bin 1 w 100. ex: `!fassa5 50`")
       .then((m) => setTimeout(() => m.delete(), 4000));
@@ -559,30 +555,34 @@ async function handleFassa5(message, args, cfg) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  VOICE CHANNEL COMMANDS
-//  !join_vc  — accepts #mention, raw ID, or channel name
-//  !leave_vc
-//  !mute_vc / !unmute_vc
-//  !deafen_vc / !undeafen_vc
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Resolve a voice channel from:
- *  1. A #channel mention
- *  2. A raw numeric ID
- *  3. A case-insensitive name match
+ * Resolve a voice channel from raw args (original casing, not lowercased).
+ *
+ * Does NOT use message.mentions.channels — Discord.js does not reliably
+ * populate that collection for voice channel mentions typed as <#id>.
+ * Instead we parse manually:
+ *
+ *  1. <#id>  →  extract the snowflake and look up directly in cache
+ *  2. digits only  →  treat as raw snowflake ID
+ *  3. anything else  →  case-insensitive name search
  */
-function resolveVoiceChannel(guild, args, mentions) {
-  // 1) Discord mention (<#id>)
-  const mentioned = mentions.channels.first();
-  if (mentioned) return mentioned.type === ChannelType.GuildVoice ? mentioned : null;
-
-  const input = args.join(" ").trim();
+function resolveVoiceChannel(guild, rawArgs) {
+  const input = rawArgs.join(" ").trim();
   if (!input) return null;
 
-  // 2) Raw snowflake ID (all digits)
+  // 1) <#id> mention format
+  const mentionMatch = input.match(/^<#(\d+)>$/);
+  if (mentionMatch) {
+    const ch = guild.channels.cache.get(mentionMatch[1]);
+    return ch?.type === ChannelType.GuildVoice ? ch : null;
+  }
+
+  // 2) Raw snowflake ID (digits only)
   if (/^\d+$/.test(input)) {
-    const byId = guild.channels.cache.get(input);
-    return byId?.type === ChannelType.GuildVoice ? byId : null;
+    const ch = guild.channels.cache.get(input);
+    return ch?.type === ChannelType.GuildVoice ? ch : null;
   }
 
   // 3) Name match (case-insensitive)
@@ -595,17 +595,19 @@ function resolveVoiceChannel(guild, args, mentions) {
   );
 }
 
-async function handleJoinVC(message, args, cfg) {
+async function handleJoinVC(message, _args, cfg) {
   if (!hasConfigAccess(message.member, cfg))
     return message.reply("ma3andekch permission.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
-  const targetChannel = resolveVoiceChannel(message.guild, args, message.mentions);
+  // Split from original message content so IDs/names aren't lowercased
+  const rawArgs = message.content.trim().split(/\s+/).slice(1);
+  const targetChannel = resolveVoiceChannel(message.guild, rawArgs);
 
   if (!targetChannel) {
     return message.reply(
-      "Ma9dartch nlqa el VC. ekteb:\n" +
-      "• `!join_vc #channel` — mention\n" +
+      "najjamtech nod5ol lel VC. ekteb:\n" +
+      "• `!join_vc <#channel>` — mention\n" +
       "• `!join_vc 123456789012345678` — ID\n" +
       "• `!join_vc channel-name` — name"
     ).then((m) => setTimeout(() => m.delete(), 6000));
@@ -617,7 +619,7 @@ async function handleJoinVC(message, args, cfg) {
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("join_vc error:", err);
-    message.reply("❌ Ma9dartch njoin. taa9ad el bot 3andou **Connect** permission fi dak el VC.")
+    message.reply("❌ najjamtech nod5ol. momken lbot ma3andouch **Connect** permission fi el VC haki.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 }
@@ -629,7 +631,7 @@ async function handleLeaveVC(message, cfg) {
 
   const botVC = message.guild.members.me.voice.channel;
   if (!botVC)
-    return message.reply("El bot mhoch fi VC.")
+    return message.reply("El bot mahouch fi VC.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
   try {
@@ -638,7 +640,7 @@ async function handleLeaveVC(message, cfg) {
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("leave_vc error:", err);
-    message.reply("❌ Ma9dartch nkhroj.")
+    message.reply("❌ njamtach no5roj.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 }
@@ -650,7 +652,7 @@ async function handleMuteVC(message, cfg) {
 
   const me = message.guild.members.me;
   if (!me.voice.channel)
-    return message.reply("El bot mhoch fi VC.")
+    return message.reply("El bot mahouch fi VC.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
   const newMute = !me.voice.serverMute;
@@ -660,7 +662,7 @@ async function handleMuteVC(message, cfg) {
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("mute_vc error:", err);
-    message.reply("❌ Ma9dartch nbadel el mute.")
+    message.reply("❌ njamtach na3mel mute.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 }
@@ -672,7 +674,7 @@ async function handleDeafenVC(message, cfg) {
 
   const me = message.guild.members.me;
   if (!me.voice.channel)
-    return message.reply("El bot mhoch fi VC.")
+    return message.reply("El bot mahouch fi VC.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
   const newDeafen = !me.voice.serverDeaf;
@@ -682,7 +684,7 @@ async function handleDeafenVC(message, cfg) {
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("deafen_vc error:", err);
-    message.reply("❌ Ma9dartch nbadel el deafen.")
+    message.reply("❌ najjamtech na3mel deafen.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 }
@@ -795,43 +797,35 @@ async function ensureMember(guildMember) {
 //  EVENT LOGS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Member Join ───────────────────────────────────────────────────────────────
 client.on("guildMemberAdd", async (member) => {
   try { await ensureMember(member); } catch (err) { console.error("guildMemberAdd DB error:", err); }
-
   sendLog(member.guild, {
-    color: Colors.join,
-    emoji: "📥",
-    title: "Member Joined",
+    color: Colors.join, emoji: "📥", title: "Member Joined",
     fields: [
-      { name: "User",       value: `${member.user} (${member.user.tag})`, inline: true },
+      { name: "User",        value: `${member.user} (${member.user.tag})`, inline: true },
       { name: "Account Age", value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
-      { name: "User ID",    value: member.user.id, inline: true },
-      { name: "Time",       value: timestamp(), inline: true },
+      { name: "User ID",     value: member.user.id, inline: true },
+      { name: "Time",        value: timestamp(), inline: true },
     ],
     footer: `Member count: ${member.guild.memberCount}`,
   });
 });
 
-// ── Member Leave / Kick ───────────────────────────────────────────────────────
 client.on("guildMemberRemove", async (member) => {
   await new Promise((r) => setTimeout(r, 1500));
-
   let kickReason = null, kickExecutor = null;
   try {
     const auditLogs = await member.guild.fetchAuditLogs({ type: AuditLogEvent.MemberKick, limit: 1 });
     const entry = auditLogs.entries.first();
     if (entry && entry.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
-      kickReason   = entry.reason ?? "No reason provided";
+      kickReason = entry.reason ?? "No reason provided";
       kickExecutor = entry.executor;
     }
   } catch { }
 
   if (kickExecutor) {
     sendLog(member.guild, {
-      color: Colors.error,
-      emoji: "👢",
-      title: "Member Kicked",
+      color: Colors.error, emoji: "👢", title: "Member Kicked",
       fields: [
         { name: "User",      value: `${member.user.tag}`, inline: true },
         { name: "User ID",   value: member.user.id, inline: true },
@@ -842,9 +836,7 @@ client.on("guildMemberRemove", async (member) => {
     });
   } else {
     sendLog(member.guild, {
-      color: Colors.leave,
-      emoji: "📤",
-      title: "Member Left",
+      color: Colors.leave, emoji: "📤", title: "Member Left",
       fields: [
         { name: "User",    value: `${member.user.tag}`, inline: true },
         { name: "User ID", value: member.user.id, inline: true },
@@ -856,34 +848,26 @@ client.on("guildMemberRemove", async (member) => {
   }
 });
 
-// ── Ban ───────────────────────────────────────────────────────────────────────
 client.on("guildBanAdd", async (ban) => {
   await new Promise((r) => setTimeout(r, 1000));
   let reason = ban.reason ?? "No reason provided", executor = null;
   try {
     const auditLogs = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 1 });
     const entry = auditLogs.entries.first();
-    if (entry && entry.target?.id === ban.user.id) {
-      reason   = entry.reason ?? reason;
-      executor = entry.executor;
-    }
+    if (entry && entry.target?.id === ban.user.id) { reason = entry.reason ?? reason; executor = entry.executor; }
   } catch { }
-
   sendLog(ban.guild, {
-    color: Colors.ban,
-    emoji: "🔨",
-    title: "Member Banned",
+    color: Colors.ban, emoji: "🔨", title: "Member Banned",
     fields: [
-      { name: "User",    value: `${ban.user.tag}`, inline: true },
-      { name: "User ID", value: ban.user.id, inline: true },
+      { name: "User",      value: `${ban.user.tag}`, inline: true },
+      { name: "User ID",   value: ban.user.id, inline: true },
       { name: "Banned By", value: executor ? `${executor}` : "Unknown", inline: true },
-      { name: "Reason",  value: reason },
-      { name: "Time",    value: timestamp(), inline: true },
+      { name: "Reason",    value: reason },
+      { name: "Time",      value: timestamp(), inline: true },
     ],
   });
 });
 
-// ── Unban ─────────────────────────────────────────────────────────────────────
 client.on("guildBanRemove", async (ban) => {
   await new Promise((r) => setTimeout(r, 1000));
   let executor = null;
@@ -892,21 +876,17 @@ client.on("guildBanRemove", async (ban) => {
     const entry = auditLogs.entries.first();
     if (entry && entry.target?.id === ban.user.id) executor = entry.executor;
   } catch { }
-
   sendLog(ban.guild, {
-    color: Colors.unban,
-    emoji: "✅",
-    title: "Member Unbanned",
+    color: Colors.unban, emoji: "✅", title: "Member Unbanned",
     fields: [
-      { name: "User",       value: `${ban.user.tag}`, inline: true },
-      { name: "User ID",    value: ban.user.id, inline: true },
+      { name: "User",        value: `${ban.user.tag}`, inline: true },
+      { name: "User ID",     value: ban.user.id, inline: true },
       { name: "Unbanned By", value: executor ? `${executor}` : "Unknown", inline: true },
-      { name: "Time",       value: timestamp(), inline: true },
+      { name: "Time",        value: timestamp(), inline: true },
     ],
   });
 });
 
-// ── Timeout / Untimeout / Nickname ────────────────────────────────────────────
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
   // Timeout applied
   if (!oldMember.communicationDisabledUntil && newMember.communicationDisabledUntil) {
@@ -914,22 +894,18 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     let reason = "No reason provided", executor = null;
     try {
       const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
-      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
-        e.changes?.some((c) => c.key === "communication_disabled_until"));
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id && e.changes?.some((c) => c.key === "communication_disabled_until"));
       if (entry) { reason = entry.reason ?? reason; executor = entry.executor; }
     } catch { }
-
     sendLog(newMember.guild, {
-      color: Colors.timeout,
-      emoji: "⏱️",
-      title: "Member Timed Out",
+      color: Colors.timeout, emoji: "⏱️", title: "Member Timed Out",
       fields: [
-        { name: "User",       value: `${newMember.user.tag}`, inline: true },
-        { name: "User ID",    value: newMember.user.id, inline: true },
+        { name: "User",         value: `${newMember.user.tag}`, inline: true },
+        { name: "User ID",      value: newMember.user.id, inline: true },
         { name: "Timed Out By", value: executor ? `${executor}` : "Unknown", inline: true },
-        { name: "Until",      value: `<t:${Math.floor(newMember.communicationDisabledUntilTimestamp / 1000)}:F>`, inline: true },
-        { name: "Reason",     value: reason },
-        { name: "Time",       value: timestamp(), inline: true },
+        { name: "Until",        value: `<t:${Math.floor(newMember.communicationDisabledUntilTimestamp / 1000)}:F>`, inline: true },
+        { name: "Reason",       value: reason },
+        { name: "Time",         value: timestamp(), inline: true },
       ],
     });
   }
@@ -940,20 +916,16 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     let executor = null;
     try {
       const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
-      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
-        e.changes?.some((c) => c.key === "communication_disabled_until"));
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id && e.changes?.some((c) => c.key === "communication_disabled_until"));
       if (entry) executor = entry.executor;
     } catch { }
-
     sendLog(newMember.guild, {
-      color: Colors.ok,
-      emoji: "🔓",
-      title: "Member Untimeout",
+      color: Colors.ok, emoji: "🔓", title: "Member Untimeout",
       fields: [
-        { name: "User",         value: `${newMember.user.tag}`, inline: true },
-        { name: "User ID",      value: newMember.user.id, inline: true },
-        { name: "Removed By",   value: executor ? `${executor}` : "Unknown / expired", inline: true },
-        { name: "Time",         value: timestamp(), inline: true },
+        { name: "User",       value: `${newMember.user.tag}`, inline: true },
+        { name: "User ID",    value: newMember.user.id, inline: true },
+        { name: "Removed By", value: executor ? `${executor}` : "Unknown / expired", inline: true },
+        { name: "Time",       value: timestamp(), inline: true },
       ],
     });
   }
@@ -964,15 +936,11 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     let executor = null;
     try {
       const auditLogs = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 5 });
-      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id &&
-        e.changes?.some((c) => c.key === "nick"));
+      const entry = auditLogs.entries.find((e) => e.target?.id === newMember.id && e.changes?.some((c) => c.key === "nick"));
       if (entry) executor = entry.executor;
     } catch { }
-
     sendLog(newMember.guild, {
-      color: Colors.nick,
-      emoji: "✏️",
-      title: "Nickname Changed",
+      color: Colors.nick, emoji: "✏️", title: "Nickname Changed",
       fields: [
         { name: "User",       value: `${newMember.user.tag}`, inline: true },
         { name: "User ID",    value: newMember.user.id, inline: true },
@@ -985,48 +953,31 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   }
 });
 
-// ── Message Deleted ───────────────────────────────────────────────────────────
 client.on("messageDelete", async (message) => {
   if (!message.guild || message.author?.bot) return;
   if (!message.content && !message.attachments?.size) return;
-
   await new Promise((r) => setTimeout(r, 1000));
   let executor = null;
   try {
     const auditLogs = await message.guild.fetchAuditLogs({ type: AuditLogEvent.MessageDelete, limit: 1 });
     const entry = auditLogs.entries.first();
-    if (
-      entry &&
-      entry.target?.id === message.author?.id &&
-      entry.extra?.channel?.id === message.channel.id &&
-      Date.now() - entry.createdTimestamp < 5000
-    ) {
+    if (entry && entry.target?.id === message.author?.id && entry.extra?.channel?.id === message.channel.id && Date.now() - entry.createdTimestamp < 5000)
       executor = entry.executor;
-    }
   } catch { }
-
   const attachmentList = message.attachments?.size
     ? [...message.attachments.values()].map((a) => `[${a.name}](${a.url})`).join(", ")
     : null;
-
   const fields = [
-    { name: "Author",  value: message.author ? `${message.author} (${message.author.tag})` : "Unknown", inline: true },
-    { name: "Channel", value: `${message.channel}`, inline: true },
+    { name: "Author",     value: message.author ? `${message.author} (${message.author.tag})` : "Unknown", inline: true },
+    { name: "Channel",    value: `${message.channel}`, inline: true },
     { name: "Deleted By", value: executor ? `${executor}` : "Author / unknown", inline: true },
   ];
-  if (message.content) fields.push({ name: "Content", value: `\`\`\`${message.content.slice(0, 900)}\`\`\`` });
-  if (attachmentList) fields.push({ name: "Attachments", value: attachmentList });
+  if (message.content)   fields.push({ name: "Content",     value: `\`\`\`${message.content.slice(0, 900)}\`\`\`` });
+  if (attachmentList)    fields.push({ name: "Attachments", value: attachmentList });
   fields.push({ name: "Time", value: timestamp(), inline: true });
-
-  sendLog(message.guild, {
-    color: Colors.delete,
-    emoji: "🗑️",
-    title: "Message Deleted",
-    fields,
-  });
+  sendLog(message.guild, { color: Colors.delete, emoji: "🗑️", title: "Message Deleted", fields });
 });
 
-// ── Message Edited ────────────────────────────────────────────────────────────
 client.on("messageUpdate", async (oldMessage, newMessage) => {
   if (newMessage.author?.bot || !newMessage.guild) return;
   if (!features.badwords || !newMessage.content) return;
@@ -1037,9 +988,7 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
   if (!isExempt && cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(newMessage.channel.id)) {
     if (oldMessage.content && oldMessage.content !== newMessage.content) {
       sendLog(newMessage.guild, {
-        color: Colors.edit,
-        emoji: "✏️",
-        title: "Message Edited",
+        color: Colors.edit, emoji: "✏️", title: "Message Edited",
         fields: [
           { name: "Author",  value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
           { name: "Channel", value: `${newMessage.channel}`, inline: true },
@@ -1057,7 +1006,6 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
 
   if (!isExempt && isBadContent(allContent)) {
     newMessage.delete().catch(() => {});
-
     let result = { action: "warn", warns: 0, timeouts: 0, timeoutUntil: null };
     try { result = await handleOffence(newMessage, newMessage.content); }
     catch (err) { console.error("handleOffence (edit) error:", err); }
@@ -1075,13 +1023,13 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
         color: actionColor, emoji: actionEmoji,
         title: `Bad Word in Edit — ${result.action.toUpperCase()}`,
         fields: [
-          { name: "User",    value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
-          { name: "Channel", value: `${newMessage.channel}`, inline: true },
-          { name: "Action",  value: result.action.toUpperCase(), inline: true },
-          { name: "Warns",   value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
-          { name: "Timeouts",value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
+          { name: "User",           value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
+          { name: "Channel",        value: `${newMessage.channel}`, inline: true },
+          { name: "Action",         value: result.action.toUpperCase(), inline: true },
+          { name: "Warns",          value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
+          { name: "Timeouts",       value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
           { name: "Edited Content", value: `\`\`\`${newMessage.content.slice(0, 300)}\`\`\`` },
-          { name: "Time",    value: timestamp(), inline: true },
+          { name: "Time",           value: timestamp(), inline: true },
         ],
         footer: "Message deleted automatically",
       });
@@ -1091,9 +1039,7 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
 
   if (oldMessage.content && oldMessage.content !== newMessage.content && features.logs) {
     sendLog(newMessage.guild, {
-      color: Colors.edit,
-      emoji: "✏️",
-      title: "Message Edited",
+      color: Colors.edit, emoji: "✏️", title: "Message Edited",
       fields: [
         { name: "Author",  value: `${newMessage.author} (${newMessage.author.tag})`, inline: true },
         { name: "Channel", value: `${newMessage.channel}`, inline: true },
@@ -1106,55 +1052,27 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
   }
 });
 
-// ── Voice Channel Activity ────────────────────────────────────────────────────
 client.on("voiceStateUpdate", (oldState, newState) => {
-  const guild  = newState.guild ?? oldState.guild;
-  const user   = newState.member?.user ?? oldState.member?.user;
+  const guild = newState.guild ?? oldState.guild;
+  const user  = newState.member?.user ?? oldState.member?.user;
   if (!guild || !user || user.bot) return;
 
   const oldCh = oldState.channel;
   const newCh = newState.channel;
 
   if (!oldCh && newCh) {
-    sendLog(guild, {
-      color: Colors.voice,
-      emoji: "🔊",
-      title: "Voice Channel Joined",
-      fields: [
-        { name: "User",    value: `${user} (${user.tag})`, inline: true },
-        { name: "Channel", value: newCh.name, inline: true },
-        { name: "Time",    value: timestamp(), inline: true },
-      ],
-    });
+    sendLog(guild, { color: Colors.voice, emoji: "🔊", title: "Voice Channel Joined",
+      fields: [{ name: "User", value: `${user} (${user.tag})`, inline: true }, { name: "Channel", value: newCh.name, inline: true }, { name: "Time", value: timestamp(), inline: true }] });
     return;
   }
-
   if (oldCh && !newCh) {
-    sendLog(guild, {
-      color: Colors.leave,
-      emoji: "🔇",
-      title: "Voice Channel Left",
-      fields: [
-        { name: "User",    value: `${user} (${user.tag})`, inline: true },
-        { name: "Channel", value: oldCh.name, inline: true },
-        { name: "Time",    value: timestamp(), inline: true },
-      ],
-    });
+    sendLog(guild, { color: Colors.leave, emoji: "🔇", title: "Voice Channel Left",
+      fields: [{ name: "User", value: `${user} (${user.tag})`, inline: true }, { name: "Channel", value: oldCh.name, inline: true }, { name: "Time", value: timestamp(), inline: true }] });
     return;
   }
-
   if (oldCh && newCh && oldCh.id !== newCh.id) {
-    sendLog(guild, {
-      color: Colors.voice,
-      emoji: "🔀",
-      title: "Voice Channel Moved",
-      fields: [
-        { name: "User",    value: `${user} (${user.tag})`, inline: true },
-        { name: "From",    value: oldCh.name, inline: true },
-        { name: "To",      value: newCh.name, inline: true },
-        { name: "Time",    value: timestamp(), inline: true },
-      ],
-    });
+    sendLog(guild, { color: Colors.voice, emoji: "🔀", title: "Voice Channel Moved",
+      fields: [{ name: "User", value: `${user} (${user.tag})`, inline: true }, { name: "From", value: oldCh.name, inline: true }, { name: "To", value: newCh.name, inline: true }, { name: "Time", value: timestamp(), inline: true }] });
   }
 });
 
@@ -1162,11 +1080,10 @@ client.on("voiceStateUpdate", (oldState, newState) => {
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
-  const { guild, channel, member } = message;
+  const { guild, member } = message;
   const content    = message.content.toLowerCase();
   const allContent = content + " " + getForwardedContent(message);
-
-  const cfg = await getConfig(guild.id);
+  const cfg        = await getConfig(guild.id);
 
   if (content.startsWith("!admin")) {
     await handleAdmin(message, message.content.trim().split(/\s+/).slice(1));
@@ -1184,8 +1101,9 @@ client.on("messageCreate", async (message) => {
     await handleFassa5(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
+  // handleJoinVC re-reads message.content internally (original casing)
   if (content.startsWith("!join_vc")) {
-    await handleJoinVC(message, message.content.trim().split(/\s+/).slice(1), cfg);
+    await handleJoinVC(message, [], cfg);
     return;
   }
   if (content.startsWith("!leave_vc")) {
@@ -1218,11 +1136,11 @@ client.on("messageCreate", async (message) => {
         const actionEmoji = { warn: "⚠️", timeout: "⏱️", ban: "🔨" }[result.action];
         const actionColor = { warn: Colors.warn, timeout: Colors.timeout, ban: Colors.ban }[result.action];
         const fields = [
-          { name: "User",    value: `${message.author} (${message.author.tag})`, inline: true },
-          { name: "Channel", value: `${message.channel}`, inline: true },
-          { name: "Action",  value: result.action.toUpperCase(), inline: true },
-          { name: "Warns",   value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
-          { name: "Timeouts",value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
+          { name: "User",     value: `${message.author} (${message.author.tag})`, inline: true },
+          { name: "Channel",  value: `${message.channel}`, inline: true },
+          { name: "Action",   value: result.action.toUpperCase(), inline: true },
+          { name: "Warns",    value: `${result.warns}/${WARNS_BEFORE_TIMEOUT}`, inline: true },
+          { name: "Timeouts", value: `${result.timeouts}/${TIMEOUTS_BEFORE_BAN}`, inline: true },
         ];
         if (result.timeoutUntil) fields.push({ name: "Muted Until", value: `<t:${Math.floor(result.timeoutUntil / 1000)}:F>`, inline: true });
         fields.push({ name: "Content", value: `\`\`\`${message.content.slice(0, 300)}\`\`\`` });
