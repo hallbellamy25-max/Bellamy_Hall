@@ -906,8 +906,11 @@ async function handleCounting(message) {
 
   const parsed = parseInt(message.content.trim(), 10);
 
-  // Ignore messages that don't start with an integer at all
-  if (isNaN(parsed)) return;
+  // Not a pure integer — delete silently and ignore (no reset)
+  if (isNaN(parsed) || String(parsed) !== message.content.trim()) {
+    await message.delete().catch(() => {});
+    return;
+  }
 
   const isCorrectNumber = parsed === state.currentCount + 1;
   const isDoubleCount   = state.lastUserId === author.id;
