@@ -935,7 +935,6 @@ async function handleCounting(message) {
   await saveCountingState(guild.id, state);
 
   await message.react("❌").catch(() => {});
-  await message.delete().catch(() => {});
 
   let reason;
   if (isDoubleCount && !isCorrectNumber) {
