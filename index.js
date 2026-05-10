@@ -28,10 +28,11 @@ mongoose
 // ══════════════════════════════════════════════════════════════════════════════
 const guildConfigSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
-  allowedChannels: { type: [String], default: [] },
-  exemptRoles:     { type: [String], default: [] },
-  configRoles:     { type: [String], default: [] },
-  logChannelId:    { type: String,   default: null },
+  allowedChannels:   { type: [String], default: [] },
+  exemptRoles:       { type: [String], default: [] },
+  configRoles:       { type: [String], default: [] },
+  logChannelId:      { type: String,   default: null },
+  countingChannelId: { type: String,   default: null },
   updatedAt: { type: Date, default: Date.now },
 });
 const GuildConfig = mongoose.model("GuildConfig", guildConfigSchema);
@@ -43,10 +44,11 @@ async function getConfig(guildId) {
   let doc = await GuildConfig.findOne({ guildId });
   if (!doc) doc = await GuildConfig.create({ guildId });
   const cfg = {
-    allowedChannels: new Set(doc.allowedChannels),
-    exemptRoles:     new Set(doc.exemptRoles),
-    configRoles:     new Set(doc.configRoles),
-    logChannelId:    doc.logChannelId ?? null,
+    allowedChannels:   new Set(doc.allowedChannels),
+    exemptRoles:       new Set(doc.exemptRoles),
+    configRoles:       new Set(doc.configRoles),
+    logChannelId:      doc.logChannelId      ?? null,
+    countingChannelId: doc.countingChannelId ?? null,
   };
   configCache.set(guildId, cfg);
   return cfg;
@@ -92,6 +94,65 @@ const memberSchema = new mongoose.Schema({
 memberSchema.index({ userId: 1, guildId: 1 }, { unique: true });
 const Member = mongoose.model("Member", memberSchema);
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  SCHEMA: OwnerMentionOffence  (standalone — separate from bad-word system)
+// ══════════════════════════════════════════════════════════════════════════════
+const ownerMentionSchema = new mongoose.Schema({
+  userId:    { type: String, required: true },
+  guildId:   { type: String, required: true },
+  username:  { type: String },
+  mentions:  { type: Number, default: 0 },
+  lastMentionAt: { type: Date, default: null },
+  history: {
+    type: [{
+      content:   String,
+      channelId: String,
+      action:    String,
+      timestamp: { type: Date, default: Date.now },
+    }],
+    default: [],
+  },
+  updatedAt: { type: Date, default: Date.now },
+});
+ownerMentionSchema.index({ userId: 1, guildId: 1 }, { unique: true });
+const OwnerMentionOffence = mongoose.model("OwnerMentionOffence", ownerMentionSchema);
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SCHEMA: CountingState  (one document per guild — persists the count)
+// ══════════════════════════════════════════════════════════════════════════════
+const countingStateSchema = new mongoose.Schema({
+  guildId:      { type: String, required: true, unique: true },
+  currentCount: { type: Number, default: 0 },
+  lastUserId:   { type: String, default: null },
+  highScore:    { type: Number, default: 0 },
+  updatedAt:    { type: Date,   default: Date.now },
+});
+const CountingState = mongoose.model("CountingState", countingStateSchema);
+
+// In-memory cache for counting state (fast reads on every message in the channel)
+const countingCache = new Map();
+
+async function getCountingState(guildId) {
+  if (countingCache.has(guildId)) return countingCache.get(guildId);
+  let doc = await CountingState.findOneAndUpdate(
+    { guildId },
+    { $setOnInsert: { currentCount: 0, lastUserId: null, highScore: 0, updatedAt: new Date() } },
+    { upsert: true, new: true }
+  );
+  const state = { currentCount: doc.currentCount, lastUserId: doc.lastUserId, highScore: doc.highScore };
+  countingCache.set(guildId, state);
+  return state;
+}
+
+async function saveCountingState(guildId, state) {
+  countingCache.set(guildId, state);
+  await CountingState.findOneAndUpdate(
+    { guildId },
+    { $set: { currentCount: state.currentCount, lastUserId: state.lastUserId, highScore: state.highScore, updatedAt: new Date() } },
+    { upsert: true }
+  );
+}
+
 // ─── Discord Client ────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
@@ -105,9 +166,9 @@ const client = new Client({
 });
 
 // ─── Features ─────────────────────────────────────────────────────────────────
-const features = { badwords: true, logs: true };
+const features = { badwords: true, logs: true, counting: true };
 
-// ─── Escalation Config ────────────────────────────────────────────────────────
+// ─── Escalation Config (bad-word system) ──────────────────────────────────────
 const WARNS_BEFORE_TIMEOUT = 3;
 const TIMEOUTS_BEFORE_BAN  = 3;
 const WARN_RESET_MS        = 30 * 60 * 1000;
@@ -128,20 +189,127 @@ function msToHuman(ms) {
   return `${m}min`;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  OWNER MENTION CONFIG  (completely standalone system)
+// ══════════════════════════════════════════════════════════════════════════════
+const OWNER_ID                    = "1432385060509581385";
+const OWNER_MENTION_WARNS_BEFORE_TIMEOUT = 3;          // 3 warnings → timeout
+const OWNER_MENTION_TIMEOUT_MS    = 10 * 60 * 1000;    // fixed 10-minute timeout
+const OWNER_MENTION_WARN_RESET_MS = 60 * 60 * 1000;    // warn counter resets after 1 h
+
+async function handleOwnerMention(message) {
+  const { author, guild, channel } = message;
+  const now = new Date();
+
+  // Fetch or create the standalone offence record
+  let doc = await OwnerMentionOffence.findOneAndUpdate(
+    { userId: author.id, guildId: guild.id },
+    { $setOnInsert: { username: author.username, mentions: 0, lastMentionAt: null, history: [], updatedAt: now } },
+    { upsert: true, new: true }
+  );
+
+  let { mentions, lastMentionAt } = doc;
+
+  // Reset counter if enough time has passed
+  if (lastMentionAt && (now - lastMentionAt) > OWNER_MENTION_WARN_RESET_MS) {
+    mentions = 0;
+  }
+
+  mentions += 1;
+
+  const left = OWNER_MENTION_WARNS_BEFORE_TIMEOUT - mentions;
+  let action = "warn";
+
+  if (mentions >= OWNER_MENTION_WARNS_BEFORE_TIMEOUT) {
+    // ── Timeout ───────────────────────────────────────────────────────────────
+    action = "timeout";
+
+    await OwnerMentionOffence.findOneAndUpdate(
+      { userId: author.id, guildId: guild.id },
+      {
+        $set:  { mentions: 0, lastMentionAt: now, updatedAt: now, username: author.username },
+        $push: { history: { $each: [{ content: message.content.slice(0, 500), channelId: channel.id, action: "timeout", timestamp: now }], $slice: -50 } },
+      }
+    );
+
+    const guildMember = await guild.members.fetch(author.id).catch(() => null);
+    if (guildMember) {
+      await guildMember.timeout(OWNER_MENTION_TIMEOUT_MS, "Repeated owner mentions").catch(console.error);
+    }
+
+    channel
+      .send(
+        `⏱️ ${author} , 3 fois t'as mentionné l'owner — get muted **10 min**. arka7 w ma t3awedch.`
+      )
+      .then((m) => setTimeout(() => m.delete(), 8000));
+
+    author
+      .send(
+        `Tu as été mute **10 minutes** pour avoir mentionné l'owner 3 fois.\nArka7 w barra men hadha.`
+      )
+      .catch(() => {});
+
+  } else {
+    // ── Warn ──────────────────────────────────────────────────────────────────
+    await OwnerMentionOffence.findOneAndUpdate(
+      { userId: author.id, guildId: guild.id },
+      {
+        $set:  { mentions, lastMentionAt: now, updatedAt: now, username: author.username },
+        $push: { history: { $each: [{ content: message.content.slice(0, 500), channelId: channel.id, action: "warn", timestamp: now }], $slice: -50 } },
+      }
+    );
+
+    channel
+      .send(
+        `⚠️ ${author} , matnajamch ta3mel mention lel owner ! Warn **${mentions}/${OWNER_MENTION_WARNS_BEFORE_TIMEOUT}** — ` +
+        `${left === 1
+          ? "warn o5ra rak takel mute 10 min !"
+          : `${left} warns mazalou w rak takel mute 10 min.`}`
+      )
+      .then((m) => setTimeout(() => m.delete(), 6000));
+  }
+
+  // ── Log embed ────────────────────────────────────────────────────────────────
+  if (features.logs) {
+    const actionEmoji = action === "timeout" ? "⏱️" : "⚠️";
+    const actionColor = action === "timeout" ? Colors.timeout : Colors.warn;
+    const fields = [
+      { name: "User",    value: `${author} (${author.tag})`, inline: true },
+      { name: "Channel", value: `${channel}`,                inline: true },
+      { name: "Action",  value: action.toUpperCase(),        inline: true },
+      { name: "Mention count", value: action === "timeout" ? `${OWNER_MENTION_WARNS_BEFORE_TIMEOUT}/${OWNER_MENTION_WARNS_BEFORE_TIMEOUT} → reset` : `${mentions}/${OWNER_MENTION_WARNS_BEFORE_TIMEOUT}`, inline: true },
+    ];
+    if (action === "timeout") {
+      fields.push({ name: "Muted for", value: "10 minutes", inline: true });
+    }
+    fields.push({ name: "Content", value: `\`\`\`${message.content.slice(0, 300)}\`\`\`` });
+    fields.push({ name: "Time",    value: timestamp(), inline: true });
+
+    const cfg = await getConfig(guild.id);
+    sendLog(guild, {
+      color: actionColor,
+      emoji: actionEmoji,
+      title: `Owner Mention — ${action.toUpperCase()}`,
+      fields,
+      footer: "Warn counter resets after 1 h • Timeout is always 10 min",
+    }, cfg.logChannelId);
+  }
+}
+
 // ─── Bad Word List ────────────────────────────────────────────────────────────
 const badWords = [
-  "zebi","zeb","زب","zbi","zb","zk","zab","zby","zaby","zeby",
-  "3asba","3siba","عصب","97ayba","9o7b","عصبة","3asb","3sb","asba",
-  "nik","niq","نيك","3acba","zuk","3ac","niek","nayak","nayk","nyk",
-  "neyek","نايك","nayek","naik","manyouk","tnaket","monaka","mounaka",
-  "kaboul","nek","sorm","سرم","zok","زك","zokek","omk","أمك","omek",
-  "omou","امك","امو","أمو","zabour","زبور","zbar","زبر","9a7ba","قحب",
-  "97iba","قحيب","9a7bet","قحبا","97ab","قحاب","9a7boun","قحبون","9a7bt",
-  "suck ma dick","mibon","wabna","wapna","wbna","wpna","ميبون","مبن",
-  "ميبن","مبون","وبن","miboun","mipoun","mipon","y3aseb","3asabet",
-  "termtek","ترم","termtec","termteq","termtk","termtc","termtq","terma",
-  "ba3bes","بعبس","kos","كس","بعباس","بعبص","بعباص","ba3bas","bazoul",
-  "بزول","بزازل","bzazel","bzoul","bazol","bezoul","bezol",
+  "zebi ","zeb "," زب","zbi ","zb ","zk ","zab ","zby ","zaby ","zeby ",
+  "3asba ","3siba "," عصب","97ayba ","9o7b "," عصبة","3asb ","3sb ","asba ",
+  "nik ","niq "," نيك","3acba ","zuk ","3ac ","niek ","nayak ","nayk ","nyk ",
+  "neyek ","نايك ","nayek ","naik ","manyouk ","tnaket ","monaka ","mounaka ",
+  "kaboul ","nek ","sorm "," سرم","zok ","زك ","zokek ","omk "," أمك","omek ",
+  "omou ","امك "," امو"," أمو","zabour ","زبور ","zbar ","زبر ","9a7ba "," قحب",
+  "97iba "," قحيب","9a7bet ","قحبا ","97ab "," قحاب","9a7boun ","قحبون ","9a7bt ",
+  "suck ma dick","mibon ","wabna ","wapna ","wbna ","wpna ","ميبون "," مبن",
+  "ميبن ","مبون "," وبن","miboun ","mipoun ","mipon ","y3aseb ","3asabet ",
+  "termtek ","ترم ","termtec ","termteq ","termtk ","termtc ","termtq ","terma ",
+  "ba3bes ","بعبس ","kos "," كس"," بعباس","بعبص ","بعباص ","ba3bas ","bazoul ",
+  "بزول ","بزازل ","bzazel ","bzoul ","bazol ","bezoul ","bezol ",
 ];
 const emojiWords = ["🖕"];
 
@@ -188,7 +356,7 @@ function isBadInHistory(userId, content) {
 }
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
-const LOG_CHANNEL_NAME = "📊・brew-logs";
+const LOG_CHANNEL_NAME = "logs";
 
 async function getLogChannelId(guildId) {
   if (configCache.has(guildId)) return configCache.get(guildId).logChannelId ?? null;
@@ -271,12 +439,17 @@ const CONFIG_HELP =
   "`!config logs set #channel` — set the log channel\n" +
   "`!config logs clear` — go back to name-based fallback (📊・brew-logs)\n" +
   "`!config logs show` — show current log channel\n\n" +
+  "**Counting channel:**\n" +
+  "`!config counting set #channel` — set the counting channel\n" +
+  "`!config counting clear` — disable counting\n" +
+  "`!config counting show` — show current counting channel\n\n" +
   "`!config show` — show full current config";
 
 const TOGGLE_HELP =
   "**!toggle** *(admin role or Manage Server required)*\n" +
   "`!toggle badwords` — turn bad-word detection on/off\n" +
   "`!toggle logs` — turn mod-log embeds on/off\n" +
+  "`!toggle counting` — turn the counting game on/off\n" +
   "`!toggle status` — show current feature states";
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -369,7 +542,7 @@ async function handleConfig(message, args, cfg) {
   const guildId = message.guild.id;
 
   if (sub === "show" || !sub) {
-    const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [], exemptRoles: [], logChannelId: null };
+    const doc = await GuildConfig.findOne({ guildId }) ?? { allowedChannels: [], exemptRoles: [], logChannelId: null, countingChannelId: null };
     const chList = doc.allowedChannels.length
       ? doc.allowedChannels.map((id) => `<#${id}>`).join(", ")
       : "All channels (no restriction)";
@@ -379,6 +552,9 @@ async function handleConfig(message, args, cfg) {
     const logChDisplay = doc.logChannelId
       ? `<#${doc.logChannelId}> (ID: \`${doc.logChannelId}\`)`
       : `Name-based fallback: **${LOG_CHANNEL_NAME}**`;
+    const countingChDisplay = doc.countingChannelId
+      ? `<#${doc.countingChannelId}> (ID: \`${doc.countingChannelId}\`)`
+      : "Not set — counting disabled";
     const embed = new EmbedBuilder()
       .setColor(Colors.info)
       .setTitle("⚙️  Bot Config")
@@ -386,6 +562,7 @@ async function handleConfig(message, args, cfg) {
         { name: "✅ Active channels (bot reads & moderates)", value: chList },
         { name: "🛡️ Exempt roles (no warns/detection)", value: exemptList },
         { name: "📋 Log channel", value: logChDisplay },
+        { name: "🔢 Counting channel", value: countingChDisplay },
       )
       .setFooter({ text: "Use !admin show to see all channel & role IDs" })
       .setTimestamp();
@@ -474,11 +651,34 @@ async function handleConfig(message, args, cfg) {
     return message.reply(CONFIG_HELP);
   }
 
-  return message.reply(CONFIG_HELP);
-}
+  if (sub === "counting") {
+    if (action === "show") {
+      const doc = await GuildConfig.findOne({ guildId });
+      const countingChDisplay = doc?.countingChannelId
+        ? `<#${doc.countingChannelId}> (\`${doc.countingChannelId}\`)`
+        : "Not set — counting is disabled.";
+      return message.reply(`🔢 Counting channel: ${countingChDisplay}`);
+    }
+    if (action === "clear") {
+      await GuildConfig.findOneAndUpdate({ guildId }, { $set: { countingChannelId: null, updatedAt: new Date() } }, { upsert: true });
+      invalidateCache(guildId);
+      return message.reply("✅ Counting channel cleared — counting is now disabled.");
+    }
+    if (action === "set") {
+      const targetChannel = message.mentions.channels.first();
+      if (!targetChannel)
+        return message.reply("Mentionni el channel. ex: `!config counting set #counting`")
+          .then((m) => setTimeout(() => m.delete(), 5000));
+      await GuildConfig.findOneAndUpdate({ guildId }, { $set: { countingChannelId: targetChannel.id, updatedAt: new Date() } }, { upsert: true });
+      invalidateCache(guildId);
+      // Reset the count so the game starts fresh in the new channel
+      await saveCountingState(guildId, { currentCount: 0, lastUserId: null, highScore: (await getCountingState(guildId)).highScore });
+      return message.reply(`✅ Counting channel set to <#${targetChannel.id}>. Count reset to 0 — start from **1**!`);
+    }
+    return message.reply(CONFIG_HELP);
+  }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  !toggle
+  return message.reply(CONFIG_HELP);
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleToggle(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
@@ -508,7 +708,7 @@ async function handleToggle(message, args, cfg) {
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleFassa5(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg)) {
-    return message.reply("ma3andekch permission. lazem **Manage Messages** bch testa3mel !fassa5.")
+    return message.reply("ma3andekch permission. 9arra9 badmin bhech tnajjem tfassa5.")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
@@ -519,7 +719,7 @@ async function handleFassa5(message, args, cfg) {
 
   const amount = parseInt(args[0]);
   if (isNaN(amount) || amount < 1 || amount > 100) {
-    return message.reply("el 3adad lazem ykoun bin 1 w 100. ex: `!fassa5 50`")
+    return message.reply("e5tar number bin 1 w 100. ex: `!fassa5 50`")
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
@@ -532,7 +732,7 @@ async function handleFassa5(message, args, cfg) {
 
   if (!deleted) {
     return message.channel
-      .send("❌ Ma9dartch namsah. taa9ad el bot 3andou **Manage Messages** permission.")
+      .send("❌ najjamtech nfassa5. el bot 3andouch **Manage Messages** permission.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 
@@ -559,35 +759,22 @@ async function handleFassa5(message, args, cfg) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  VOICE CHANNEL COMMANDS
-//  Uses @discordjs/voice for joining/leaving (works from scratch, not just moving)
 // ══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Resolve a voice channel from raw args (original casing).
- * Does NOT use message.mentions.channels — unreliable for voice channels.
- *
- *  1. <#id> mention format  →  extract ID, look up in cache
- *  2. Raw snowflake ID       →  look up in cache
- *  3. Case-insensitive name  →  search cache
- */
 function resolveVoiceChannel(guild, rawArgs) {
   const input = rawArgs.join(" ").trim();
   if (!input) return null;
 
-  // 1) <#id> mention
   const mentionMatch = input.match(/^<#(\d+)>$/);
   if (mentionMatch) {
     const ch = guild.channels.cache.get(mentionMatch[1]);
     return ch?.type === ChannelType.GuildVoice ? ch : null;
   }
 
-  // 2) Raw snowflake ID
   if (/^\d+$/.test(input)) {
     const ch = guild.channels.cache.get(input);
     return ch?.type === ChannelType.GuildVoice ? ch : null;
   }
 
-  // 3) Name match
   return (
     guild.channels.cache.find(
       (c) =>
@@ -602,7 +789,6 @@ async function handleJoinVC(message, cfg) {
     return message.reply("ma3andekch permission.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
-  // Use original-cased content so IDs/names aren't corrupted by toLowerCase()
   const rawArgs = message.content.trim().split(/\s+/).slice(1);
   const targetChannel = resolveVoiceChannel(message.guild, rawArgs);
 
@@ -616,7 +802,6 @@ async function handleJoinVC(message, cfg) {
   }
 
   try {
-    // Destroy any existing connection in this guild first
     const existing = getVoiceConnection(message.guild.id);
     if (existing) existing.destroy();
 
@@ -702,7 +887,69 @@ async function handleDeafenVC(message, cfg) {
   }
 }
 
-// ─── Offence handler ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  COUNTING GAME HANDLER
+//  Rules:
+//   • Only the configured counting channel is watched
+//   • Messages must be exactly the next integer (e.g. "42" or "  42  ")
+//   • The same user cannot count twice in a row
+//   • Any violation → delete message, react ❌, announce reset, restart from 1
+//   • New high score is celebrated with 🎉
+// ══════════════════════════════════════════════════════════════════════════════
+async function handleCounting(message) {
+  const { author, guild, channel } = message;
+  const state = await getCountingState(guild.id);
+
+  const parsed = parseInt(message.content.trim(), 10);
+
+  // Ignore messages that don't start with an integer at all
+  if (isNaN(parsed)) return;
+
+  const isCorrectNumber = parsed === state.currentCount + 1;
+  const isDoubleCount   = state.lastUserId === author.id;
+
+  // ── Valid count ────────────────────────────────────────────────────────────
+  if (isCorrectNumber && !isDoubleCount) {
+    state.currentCount = parsed;
+    state.lastUserId   = author.id;
+    const newHigh = parsed > state.highScore;
+    if (newHigh) state.highScore = parsed;
+
+    await saveCountingState(guild.id, state);
+    await message.react("✅").catch(() => {});
+    if (newHigh && parsed > 1) {
+      channel.send(`🎉 New high score: **${parsed}**! Keep going!`)
+        .then((m) => setTimeout(() => m.delete(), 5000));
+    }
+    return;
+  }
+
+  // ── Violation — delete and reset ──────────────────────────────────────────
+  const prevCount   = state.currentCount;
+  const prevHigh    = state.highScore;
+  state.currentCount = 0;
+  state.lastUserId   = null;
+  await saveCountingState(guild.id, state);
+
+  await message.react("❌").catch(() => {});
+  await message.delete().catch(() => {});
+
+  let reason;
+  if (isDoubleCount && !isCorrectNumber) {
+    reason = `${author} wrote twice in a row AND gave the wrong number`;
+  } else if (isDoubleCount) {
+    reason = `${author} wrote twice in a row`;
+  } else {
+    reason = `${author} gave the wrong number (expected **${prevCount + 1}**, got **${message.content.trim().slice(0, 20)}**)`;
+  }
+
+  channel.send(
+    `❌ ${reason} — count reset! We were at **${prevCount}** (high score: **${prevHigh}**).\n` +
+    `Start again from **1**!`
+  ).then((m) => setTimeout(() => m.delete(), 10000));
+}
+
+// ─── Offence handler (bad-word system only) ───────────────────────────────────
 async function handleOffence(message, offendingContent) {
   const { author, guild, channel } = message;
   const now = new Date();
@@ -1131,6 +1378,36 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  //  COUNTING GAME  (standalone channel — feature-toggled)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (features.counting && cfg.countingChannelId && message.channel.id === cfg.countingChannelId) {
+    try { await handleCounting(message); }
+    catch (err) { console.error("handleCounting error:", err); }
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  OWNER MENTION DETECTION  (standalone — does NOT touch bad-word counters)
+  //  • Superusers are exempt
+  //  • exemptRoles are also exempt
+  //  • Own separate MongoDB collection (OwnerMentionOffence)
+  //  • 3 mentions → 10-minute timeout, counter resets after 1 h
+  // ══════════════════════════════════════════════════════════════════════════
+  const isOwnerMentionExempt =
+    isSuperuser(member) ||
+    member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
+
+  if (!isOwnerMentionExempt && message.mentions.users.has(OWNER_ID)) {
+    await message.delete().catch(() => {});
+    try { await handleOwnerMention(message); }
+    catch (err) { console.error("handleOwnerMention error:", err); }
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  BAD-WORD DETECTION  (original system — untouched)
+  // ══════════════════════════════════════════════════════════════════════════
   const isExempt = isSuperuser(member) || member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
   if (features.badwords && !isExempt) {
