@@ -922,8 +922,7 @@ async function handleCounting(message) {
     await saveCountingState(guild.id, state);
     await message.react("✅").catch(() => {});
     if (newHigh && parsed > 1) {
-      channel.send(`🎉 New high score: **${parsed}**! Keep going!`)
-        .then((m) => setTimeout(() => m.delete(), 5000));
+      channel.send(`🎉 New high score: **${parsed}**! Keep going!`).catch(() => {});
     }
     return;
   }
@@ -950,7 +949,7 @@ async function handleCounting(message) {
   channel.send(
     `❌ ${reason} — count reset! We were at **${prevCount}** (high score: **${prevHigh}**).\n` +
     `Start again from **1**!`
-  ).then((m) => setTimeout(() => m.delete(), 10000));
+  ).catch(() => {});
 }
 
 // ─── Offence handler (bad-word system only) ───────────────────────────────────
