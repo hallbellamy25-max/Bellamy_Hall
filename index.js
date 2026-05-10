@@ -7,6 +7,10 @@ const {
   ChannelType,
   PermissionFlagsBits,
 } = require("discord.js");
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+} = require("@discordjs/voice");
 const OpenAI = require("openai");
 const mongoose = require("mongoose");
 
@@ -555,37 +559,35 @@ async function handleFassa5(message, args, cfg) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  VOICE CHANNEL COMMANDS
+//  Uses @discordjs/voice for joining/leaving (works from scratch, not just moving)
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Resolve a voice channel from raw args (original casing, not lowercased).
+ * Resolve a voice channel from raw args (original casing).
+ * Does NOT use message.mentions.channels — unreliable for voice channels.
  *
- * Does NOT use message.mentions.channels — Discord.js does not reliably
- * populate that collection for voice channel mentions typed as <#id>.
- * Instead we parse manually:
- *
- *  1. <#id>  →  extract the snowflake and look up directly in cache
- *  2. digits only  →  treat as raw snowflake ID
- *  3. anything else  →  case-insensitive name search
+ *  1. <#id> mention format  →  extract ID, look up in cache
+ *  2. Raw snowflake ID       →  look up in cache
+ *  3. Case-insensitive name  →  search cache
  */
 function resolveVoiceChannel(guild, rawArgs) {
   const input = rawArgs.join(" ").trim();
   if (!input) return null;
 
-  // 1) <#id> mention format
+  // 1) <#id> mention
   const mentionMatch = input.match(/^<#(\d+)>$/);
   if (mentionMatch) {
     const ch = guild.channels.cache.get(mentionMatch[1]);
     return ch?.type === ChannelType.GuildVoice ? ch : null;
   }
 
-  // 2) Raw snowflake ID (digits only)
+  // 2) Raw snowflake ID
   if (/^\d+$/.test(input)) {
     const ch = guild.channels.cache.get(input);
     return ch?.type === ChannelType.GuildVoice ? ch : null;
   }
 
-  // 3) Name match (case-insensitive)
+  // 3) Name match
   return (
     guild.channels.cache.find(
       (c) =>
@@ -595,12 +597,12 @@ function resolveVoiceChannel(guild, rawArgs) {
   );
 }
 
-async function handleJoinVC(message, _args, cfg) {
+async function handleJoinVC(message, cfg) {
   if (!hasConfigAccess(message.member, cfg))
     return message.reply("ma3andekch permission.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
-  // Split from original message content so IDs/names aren't lowercased
+  // Use original-cased content so IDs/names aren't corrupted by toLowerCase()
   const rawArgs = message.content.trim().split(/\s+/).slice(1);
   const targetChannel = resolveVoiceChannel(message.guild, rawArgs);
 
@@ -614,12 +616,23 @@ async function handleJoinVC(message, _args, cfg) {
   }
 
   try {
-    await message.guild.members.me.voice.setChannel(targetChannel);
+    // Destroy any existing connection in this guild first
+    const existing = getVoiceConnection(message.guild.id);
+    if (existing) existing.destroy();
+
+    joinVoiceChannel({
+      channelId: targetChannel.id,
+      guildId:   targetChannel.guild.id,
+      adapterCreator: targetChannel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
     message.reply(`✅ Bot joined **${targetChannel.name}** (\`${targetChannel.id}\`).`)
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("join_vc error:", err);
-    message.reply("❌ najjamtech nod5ol. momken lbot ma3andouch **Connect** permission fi el VC haki.")
+    message.reply("❌ najjamtech nod5ol. taa9ad el bot 3andou **Connect** permission fi el VC haki.")
       .then((m) => setTimeout(() => m.delete(), 5000));
   }
 }
@@ -629,14 +642,14 @@ async function handleLeaveVC(message, cfg) {
     return message.reply("ma3andekch permission.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
-  const botVC = message.guild.members.me.voice.channel;
-  if (!botVC)
+  const connection = getVoiceConnection(message.guild.id);
+  if (!connection)
     return message.reply("El bot mahouch fi VC.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
   try {
-    await message.guild.members.me.voice.setChannel(null);
-    message.reply(`✅ Bot left **${botVC.name}**.`)
+    connection.destroy();
+    message.reply("✅ Bot left the voice channel.")
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("leave_vc error:", err);
@@ -972,8 +985,8 @@ client.on("messageDelete", async (message) => {
     { name: "Channel",    value: `${message.channel}`, inline: true },
     { name: "Deleted By", value: executor ? `${executor}` : "Author / unknown", inline: true },
   ];
-  if (message.content)   fields.push({ name: "Content",     value: `\`\`\`${message.content.slice(0, 900)}\`\`\`` });
-  if (attachmentList)    fields.push({ name: "Attachments", value: attachmentList });
+  if (message.content)  fields.push({ name: "Content",     value: `\`\`\`${message.content.slice(0, 900)}\`\`\`` });
+  if (attachmentList)   fields.push({ name: "Attachments", value: attachmentList });
   fields.push({ name: "Time", value: timestamp(), inline: true });
   sendLog(message.guild, { color: Colors.delete, emoji: "🗑️", title: "Message Deleted", fields });
 });
@@ -1101,9 +1114,8 @@ client.on("messageCreate", async (message) => {
     await handleFassa5(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
-  // handleJoinVC re-reads message.content internally (original casing)
   if (content.startsWith("!join_vc")) {
-    await handleJoinVC(message, [], cfg);
+    await handleJoinVC(message, cfg);
     return;
   }
   if (content.startsWith("!leave_vc")) {
