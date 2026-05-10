@@ -561,6 +561,109 @@ async function handleFassa5(message, args, cfg) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  VOICE CHANNEL COMMANDS
+//  !join_vc #channel  — bot joins a VC
+//  !leave_vc          — bot leaves its current VC
+//  !mute_vc           — toggle server-mute on the bot
+//  !deafen_vc         — toggle server-deafen on the bot
+//  Access: superuser | Manage Server | configRole
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function handleJoinVC(message, args, cfg) {
+  if (!hasConfigAccess(message.member, cfg))
+    return message.reply("ma3andekch permission.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  // Accept a mentioned channel or find by name from args
+  const mentioned = message.mentions.channels.first();
+  const targetChannel = mentioned
+    ?? message.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildVoice &&
+               c.name.toLowerCase() === args.join(" ").toLowerCase()
+      );
+
+  if (!targetChannel || targetChannel.type !== ChannelType.GuildVoice) {
+    return message.reply("Ma9dartch nlqa el VC. ekteb `!join_vc #channel` wella `!join_vc channel-name`.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+
+  try {
+    await message.guild.members.me.voice.setChannel(targetChannel);
+    message.reply(`✅ Bot joined **${targetChannel.name}**.`)
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  } catch (err) {
+    console.error("join_vc error:", err);
+    message.reply("❌ Ma9dartch njoin. taa9ad el bot 3andou **Connect** permission fi dak el VC.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+}
+
+async function handleLeaveVC(message, cfg) {
+  if (!hasConfigAccess(message.member, cfg))
+    return message.reply("ma3andekch permission.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  const botVC = message.guild.members.me.voice.channel;
+  if (!botVC)
+    return message.reply("El bot mhoch fi VC.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  try {
+    await message.guild.members.me.voice.setChannel(null);
+    message.reply(`✅ Bot left **${botVC.name}**.`)
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  } catch (err) {
+    console.error("leave_vc error:", err);
+    message.reply("❌ Ma9dartch nkhroj.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+}
+
+async function handleMuteVC(message, cfg) {
+  if (!hasConfigAccess(message.member, cfg))
+    return message.reply("ma3andekch permission.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  const me = message.guild.members.me;
+  if (!me.voice.channel)
+    return message.reply("El bot mhoch fi VC.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  const newMute = !me.voice.serverMute;
+  try {
+    await me.voice.setMute(newMute);
+    message.reply(`✅ Bot is now **${newMute ? "🔇 server-muted" : "🔊 unmuted"}**.`)
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  } catch (err) {
+    console.error("mute_vc error:", err);
+    message.reply("❌ Ma9dartch nbadel el mute.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+}
+
+async function handleDeafenVC(message, cfg) {
+  if (!hasConfigAccess(message.member, cfg))
+    return message.reply("ma3andekch permission.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  const me = message.guild.members.me;
+  if (!me.voice.channel)
+    return message.reply("El bot mhoch fi VC.")
+      .then((m) => setTimeout(() => m.delete(), 4000));
+
+  const newDeafen = !me.voice.serverDeaf;
+  try {
+    await me.voice.setDeaf(newDeafen);
+    message.reply(`✅ Bot is now **${newDeafen ? "🔕 server-deafened" : "🔔 undeafened"}**.`)
+      .then((m) => setTimeout(() => m.delete(), 4000));
+  } catch (err) {
+    console.error("deafen_vc error:", err);
+    message.reply("❌ Ma9dartch nbadel el deafen.")
+      .then((m) => setTimeout(() => m.delete(), 5000));
+  }
+}
+
 // ─── Offence handler ──────────────────────────────────────────────────────────
 async function handleOffence(message, offendingContent) {
   const { author, guild, channel } = message;
@@ -1072,7 +1175,23 @@ client.on("messageCreate", async (message) => {
   }
 
 
-  if (cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(channel.id)) return;
+  if (content.startsWith("!join_vc")) {
+    await handleJoinVC(message, message.content.trim().split(/\s+/).slice(1), cfg);
+    return;
+  }
+  if (content.startsWith("!leave_vc")) {
+    await handleLeaveVC(message, cfg);
+    return;
+  }
+  if (content.startsWith("!mute_vc") || content.startsWith("!unmute_vc")) {
+    await handleMuteVC(message, cfg);
+    return;
+  }
+  if (content.startsWith("!deafen_vc") || content.startsWith("!undeafen_vc")) {
+    await handleDeafenVC(message, cfg);
+    return;
+  }
+
 
   const isExempt = isSuperuser(member) || member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
