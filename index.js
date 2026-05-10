@@ -27,7 +27,7 @@ const guildConfigSchema = new mongoose.Schema({
   allowedChannels: { type: [String], default: [] },
   exemptRoles:     { type: [String], default: [] },
   configRoles:     { type: [String], default: [] },
-  logChannelId:    { type: String,   default: null },  // null = fall back to name-based lookup
+  logChannelId:    { type: String,   default: null },
   updatedAt: { type: Date, default: Date.now },
 });
 const GuildConfig = mongoose.model("GuildConfig", guildConfigSchema);
@@ -96,7 +96,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
-    GatewayIntentBits.GuildVoiceStates,   // needed for voice logs
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
@@ -227,7 +227,7 @@ const Colors = {
 //  PERMISSION SYSTEM
 // ══════════════════════════════════════════════════════════════════════════════
 
-const SUPERUSERS = new Set(["544462092602966026"]); // 3amer3823 — full access, no restrictions
+const SUPERUSERS = new Set(["544462092602966026"]);
 
 function isSuperuser(member) {
   return SUPERUSERS.has(member.user.id);
@@ -501,10 +501,8 @@ async function handleToggle(message, args, cfg) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  !fassa5 [amount] — bulk delete messages (default 10, max 100)
-//  Requires: Manage Messages OR superuser
+//  !fassa5
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function handleFassa5(message, args, cfg) {
   const canUse = hasConfigAccess(message.member, cfg);
 
@@ -525,10 +523,8 @@ async function handleFassa5(message, args, cfg) {
       .then((m) => setTimeout(() => m.delete(), 4000));
   }
 
-  // Delete the command message first
   await message.delete().catch(() => {});
 
-  // Discord only lets you bulk-delete messages newer than 14 days
   const deleted = await message.channel.bulkDelete(amount, true).catch((err) => {
     console.error("fassa5 bulkDelete error:", err);
     return null;
@@ -563,34 +559,61 @@ async function handleFassa5(message, args, cfg) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  VOICE CHANNEL COMMANDS
-//  !join_vc #channel  — bot joins a VC
-//  !leave_vc          — bot leaves its current VC
-//  !mute_vc           — toggle server-mute on the bot
-//  !deafen_vc         — toggle server-deafen on the bot
-//  Access: superuser | Manage Server | configRole
+//  !join_vc  — accepts #mention, raw ID, or channel name
+//  !leave_vc
+//  !mute_vc / !unmute_vc
+//  !deafen_vc / !undeafen_vc
 // ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve a voice channel from:
+ *  1. A #channel mention
+ *  2. A raw numeric ID
+ *  3. A case-insensitive name match
+ */
+function resolveVoiceChannel(guild, args, mentions) {
+  // 1) Discord mention (<#id>)
+  const mentioned = mentions.channels.first();
+  if (mentioned) return mentioned.type === ChannelType.GuildVoice ? mentioned : null;
+
+  const input = args.join(" ").trim();
+  if (!input) return null;
+
+  // 2) Raw snowflake ID (all digits)
+  if (/^\d+$/.test(input)) {
+    const byId = guild.channels.cache.get(input);
+    return byId?.type === ChannelType.GuildVoice ? byId : null;
+  }
+
+  // 3) Name match (case-insensitive)
+  return (
+    guild.channels.cache.find(
+      (c) =>
+        c.type === ChannelType.GuildVoice &&
+        c.name.toLowerCase() === input.toLowerCase()
+    ) ?? null
+  );
+}
 
 async function handleJoinVC(message, args, cfg) {
   if (!hasConfigAccess(message.member, cfg))
     return message.reply("ma3andekch permission.")
       .then((m) => setTimeout(() => m.delete(), 4000));
 
-  // Accept a mentioned channel or find by name from args
-  const mentioned = message.mentions.channels.first();
-  const targetChannel = mentioned
-    ?? message.guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildVoice &&
-               c.name.toLowerCase() === args.join(" ").toLowerCase()
-      );
+  const targetChannel = resolveVoiceChannel(message.guild, args, message.mentions);
 
-  if (!targetChannel || targetChannel.type !== ChannelType.GuildVoice) {
-    return message.reply("Ma9dartch nlqa el VC. ekteb `!join_vc #channel` wella `!join_vc channel-name`.")
-      .then((m) => setTimeout(() => m.delete(), 5000));
+  if (!targetChannel) {
+    return message.reply(
+      "Ma9dartch nlqa el VC. ekteb:\n" +
+      "• `!join_vc #channel` — mention\n" +
+      "• `!join_vc 123456789012345678` — ID\n" +
+      "• `!join_vc channel-name` — name"
+    ).then((m) => setTimeout(() => m.delete(), 6000));
   }
 
   try {
     await message.guild.members.me.voice.setChannel(targetChannel);
-    message.reply(`✅ Bot joined **${targetChannel.name}**.`)
+    message.reply(`✅ Bot joined **${targetChannel.name}** (\`${targetChannel.id}\`).`)
       .then((m) => setTimeout(() => m.delete(), 4000));
   } catch (err) {
     console.error("join_vc error:", err);
@@ -768,14 +791,9 @@ async function ensureMember(guildMember) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  ███████╗██╗   ██╗███████╗███╗   ██╗████████╗    ██╗      ██████╗  ██████╗ ███████╗
-//  ██╔════╝██║   ██║██╔════╝████╗  ██║╚══██╔══╝    ██║     ██╔═══██╗██╔════╝ ██╔════╝
-//  █████╗  ██║   ██║█████╗  ██╔██╗ ██║   ██║       ██║     ██║   ██║██║  ███╗███████╗
-//  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██║╚██╗██║   ██║       ██║     ██║   ██║██║   ██║╚════██║
-//  ███████╗ ╚████╔╝ ███████╗██║ ╚████║   ██║        ███████╗╚██████╔╝╚██████╔╝███████║
-//  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝  ╚═╝         ╚══════╝ ╚═════╝  ╚═════╝ ╚══════╝
-// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+//  EVENT LOGS
+// ══════════════════════════════════════════════════════════════════════════════
 
 // ── Member Join ───────────────────────────────────────────────────────────────
 client.on("guildMemberAdd", async (member) => {
@@ -797,7 +815,6 @@ client.on("guildMemberAdd", async (member) => {
 
 // ── Member Leave / Kick ───────────────────────────────────────────────────────
 client.on("guildMemberRemove", async (member) => {
-  // Wait briefly so the audit log has time to populate
   await new Promise((r) => setTimeout(r, 1500));
 
   let kickReason = null, kickExecutor = null;
@@ -808,10 +825,9 @@ client.on("guildMemberRemove", async (member) => {
       kickReason   = entry.reason ?? "No reason provided";
       kickExecutor = entry.executor;
     }
-  } catch { /* audit log unavailable */ }
+  } catch { }
 
   if (kickExecutor) {
-    // It was a kick
     sendLog(member.guild, {
       color: Colors.error,
       emoji: "👢",
@@ -825,7 +841,6 @@ client.on("guildMemberRemove", async (member) => {
       ],
     });
   } else {
-    // Voluntary leave
     sendLog(member.guild, {
       color: Colors.leave,
       emoji: "📤",
@@ -891,9 +906,9 @@ client.on("guildBanRemove", async (ban) => {
   });
 });
 
-// ── Timeout / Untimeout ───────────────────────────────────────────────────────
+// ── Timeout / Untimeout / Nickname ────────────────────────────────────────────
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
-  // ── Timeout applied ──────────────────────────────────────────────────────
+  // Timeout applied
   if (!oldMember.communicationDisabledUntil && newMember.communicationDisabledUntil) {
     await new Promise((r) => setTimeout(r, 1000));
     let reason = "No reason provided", executor = null;
@@ -919,7 +934,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     });
   }
 
-  // ── Timeout removed ──────────────────────────────────────────────────────
+  // Timeout removed
   if (oldMember.communicationDisabledUntil && !newMember.communicationDisabledUntil) {
     await new Promise((r) => setTimeout(r, 1000));
     let executor = null;
@@ -943,7 +958,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     });
   }
 
-  // ── Nickname changed ──────────────────────────────────────────────────────
+  // Nickname changed
   if (oldMember.nickname !== newMember.nickname) {
     await new Promise((r) => setTimeout(r, 1000));
     let executor = null;
@@ -972,7 +987,6 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 
 // ── Message Deleted ───────────────────────────────────────────────────────────
 client.on("messageDelete", async (message) => {
-  // Ignore partial messages with no content, bot messages, and DMs
   if (!message.guild || message.author?.bot) return;
   if (!message.content && !message.attachments?.size) return;
 
@@ -981,7 +995,6 @@ client.on("messageDelete", async (message) => {
   try {
     const auditLogs = await message.guild.fetchAuditLogs({ type: AuditLogEvent.MessageDelete, limit: 1 });
     const entry = auditLogs.entries.first();
-    // Only credit the executor if the delete was very recent and matches channel + author
     if (
       entry &&
       entry.target?.id === message.author?.id &&
@@ -1015,7 +1028,6 @@ client.on("messageDelete", async (message) => {
 
 // ── Message Edited ────────────────────────────────────────────────────────────
 client.on("messageUpdate", async (oldMessage, newMessage) => {
-  // ─ Bad-word check on edited messages (existing logic) ─────────────────────
   if (newMessage.author?.bot || !newMessage.guild) return;
   if (!features.badwords || !newMessage.content) return;
 
@@ -1023,7 +1035,6 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
   const isExempt = isSuperuser(newMessage.member) || newMessage.member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
   if (!isExempt && cfg.allowedChannels.size > 0 && !cfg.allowedChannels.has(newMessage.channel.id)) {
-    // outside monitored channels — only log the edit, don't moderate
     if (oldMessage.content && oldMessage.content !== newMessage.content) {
       sendLog(newMessage.guild, {
         color: Colors.edit,
@@ -1078,7 +1089,6 @@ client.on("messageUpdate", async (oldMessage, newMessage) => {
     return;
   }
 
-  // ─ Log clean edits ────────────────────────────────────────────────────────
   if (oldMessage.content && oldMessage.content !== newMessage.content && features.logs) {
     sendLog(newMessage.guild, {
       color: Colors.edit,
@@ -1105,7 +1115,6 @@ client.on("voiceStateUpdate", (oldState, newState) => {
   const oldCh = oldState.channel;
   const newCh = newState.channel;
 
-  // Join
   if (!oldCh && newCh) {
     sendLog(guild, {
       color: Colors.voice,
@@ -1120,7 +1129,6 @@ client.on("voiceStateUpdate", (oldState, newState) => {
     return;
   }
 
-  // Leave
   if (oldCh && !newCh) {
     sendLog(guild, {
       color: Colors.leave,
@@ -1135,7 +1143,6 @@ client.on("voiceStateUpdate", (oldState, newState) => {
     return;
   }
 
-  // Move
   if (oldCh && newCh && oldCh.id !== newCh.id) {
     sendLog(guild, {
       color: Colors.voice,
@@ -1169,12 +1176,14 @@ client.on("messageCreate", async (message) => {
     await handleConfig(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
+  if (content.startsWith("!toggle")) {
+    await handleToggle(message, message.content.trim().split(/\s+/).slice(1), cfg);
+    return;
+  }
   if (content.startsWith("!fassa5")) {
     await handleFassa5(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
   }
-
-
   if (content.startsWith("!join_vc")) {
     await handleJoinVC(message, message.content.trim().split(/\s+/).slice(1), cfg);
     return;
@@ -1191,7 +1200,6 @@ client.on("messageCreate", async (message) => {
     await handleDeafenVC(message, cfg);
     return;
   }
-
 
   const isExempt = isSuperuser(member) || member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
