@@ -292,36 +292,181 @@ async function handleOwnerMention(message) {
 }
 
 // ─── Bad Word List ────────────────────────────────────────────────────────────
+// Each entry is the bad word/phrase WITHOUT trailing space.
+// Matching is done with word-boundary awareness — see isBadContent() below.
 const badWords = [
-  "zebi ","zeb "," زب","zbi ","zb ","zk ","zab ","zby ","zaby ","zeby ",
-  "3asba ","3siba "," عصب","97ayba ","9o7b "," عصبة","3asb ","3sb ","asba ",
-  "nik ","niq "," نيك","3acba ","zuk ","3ac ","niek ","nayak ","nayk ","nyk ",
-  "neyek ","نايك ","nayek ","naik ","manyouk ","tnaket ","monaka ","mounaka ",
-  "kaboul ","nek ","sorm "," سرم","zok ","زك ","zokek ","omk "," أمك","omek ",
-  "omou ","امك "," امو"," أمو","zabour ","زبور ","zbar ","زبر ","9a7ba "," قحب",
-  "97iba "," قحيب","9a7bet ","قحبا ","97ab "," قحاب","9a7boun ","قحبون ","9a7bt ",
-  "suck ma dick","mibon ","wabna ","wapna ","wbna ","wpna ","ميبون "," مبن",
-  "ميبن ","مبون "," وبن","miboun ","mipoun ","mipon ","y3aseb ","3asabet ",
-  "termtek ","ترم ","termtec ","termteq ","termtk ","termtc ","termtq ","terma ",
-  "ba3bes ","بعبس ","kos "," كس"," بعباس","بعبص ","بعباص ","ba3bas ","bazoul ",
-  "بزول ","بزازل ","bzazel ","bzoul ","bazol ","bezoul ","bezol ",
+  "zebi","zeb"," زب","zbi","zb","zk","zab","zby","zaby","zeby",
+  "3asba","3siba"," عصب","97ayba","9o7b"," عصبة","3asb","3sb","asba",
+  "nik","niq"," نيك","3acba","zuk","3ac","niek","nayak","nayk","nyk",
+  "neyek","نايك","nayek","naik","manyouk","tnaket","monaka","mounaka",
+  "kaboul","nek","sorm"," سرم","zok","زك","zokek","omk"," أمك","omek",
+  "omou","امك"," امو"," أمو","zabour","زبور","zbar","زبر","9a7ba"," قحب",
+  "97iba"," قحيب","9a7bet","قحبا","97ab"," قحاب","9a7boun","قحبون","9a7bt",
+  "suck ma dick","mibon","wabna","wapna","wbna","wpna","ميبون"," مبن",
+  "ميبن","مبون"," وبن","miboun","mipoun","mipon","y3aseb","3asabet",
+  "termtek","ترم","termtec","termteq","termtk","termtc","termtq","terma",
+  "ba3bes","بعبس","kos"," كس"," بعباس","بعبص","بعباص","ba3bas","bazoul",
+  "بزول","بزازل","bzazel","bzoul","bazol","bezoul","bezol",
 ];
 const emojiWords = ["🖕"];
 
-// ─── Text Helpers ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  BAD-WORD DETECTION  (fixed — word-boundary aware + evasion detection)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Normalize a string for comparison:
+ * - lowercase
+ * - collapse repeated characters (leet-speak style: "niiik" → "nik")
+ * - keep letters, digits, Arabic chars, and spaces (spaces preserved for boundary checks)
+ */
 function normalize(str) {
-  return str.toLowerCase()
-    .replace(/[^a-z0-9\u0600-\u06FF]/g, "")
-    .replace(/(.)\1+/g, "$1");
+  return str
+    .toLowerCase()
+    .replace(/(.)\1+/g, "$1"); // collapse repeated chars but KEEP spaces & word chars
 }
+
+/**
+ * Strip everything except alphanumeric, Arabic, and spaces.
+ * Used to build the "clean" version of content for word-boundary matching.
+ */
+function stripPunctuation(str) {
+  return str.replace(/[^a-z0-9\u0600-\u06FF\s]/gi, " ");
+}
+
+/**
+ * Detect "spaced-out" evasion: someone typing "n a k" or "n  a  k" or "n.a.k"
+ * to sneak past filters. This collapses isolated single letters/chars that are
+ * separated by spaces or punctuation into a joined token.
+ *
+ * Example: "hey n a k stop it" → "hey nak stop it"
+ * "normal nakel word" → "normal nakel word"  (nakel is a full word, not spaced out)
+ *
+ * Strategy: find runs of single characters separated by 1–2 non-alpha chars and
+ * collapse them, but only when the run is ≥ 3 chars long (to avoid false positives
+ * on things like "a b" which might be normal list items).
+ */
+function collapseSpacedLetters(str) {
+  // Match sequences of (single char)(separator)(single char)... of length >= 3 letters
+  // Separator: 1-2 of: space, dot, dash, underscore, comma
+  return str.replace(
+    /(?<![a-z0-9\u0600-\u06FF])([a-z\u0600-\u06FF])([\s.\-_,]{1,2}(?=[a-z\u0600-\u06FF](?:[\s.\-_,]{1,2}[a-z\u0600-\u06FF])+)){0}(?:([\s.\-_,]{1,2})([a-z\u0600-\u06FF])){2,}(?![a-z0-9\u0600-\u06FF])/gi,
+    (match) => {
+      // Extract only the letter characters from this spaced-out run
+      const letters = match.match(/[a-z\u0600-\u06FF]/gi);
+      if (!letters || letters.length < 3) return match; // too short, leave alone
+      return " " + letters.join("") + " ";
+    }
+  );
+}
+
+/**
+ * Check if `needle` appears in `haystack` as a whole word (word-boundary aware).
+ * Both needle and haystack should already be normalized and punctuation-stripped.
+ *
+ * "Word boundary" here means: the character before and after the needle match
+ * must NOT be an alphanumeric/Arabic character.
+ */
+function containsWholeWord(haystack, needle) {
+  if (!needle || !haystack) return false;
+  const idx = haystack.indexOf(needle);
+  if (idx === -1) return false;
+
+  // Check every occurrence
+  let searchFrom = 0;
+  while (searchFrom <= haystack.length - needle.length) {
+    const pos = haystack.indexOf(needle, searchFrom);
+    if (pos === -1) break;
+
+    const charBefore = pos > 0 ? haystack[pos - 1] : " ";
+    const charAfter  = pos + needle.length < haystack.length ? haystack[pos + needle.length] : " ";
+
+    const isWordChar = (c) => /[a-z0-9\u0600-\u06FF]/i.test(c);
+
+    // It's a match only if it's not embedded inside a longer word
+    if (!isWordChar(charBefore) && !isWordChar(charAfter)) {
+      return true;
+    }
+
+    searchFrom = pos + 1;
+  }
+  return false;
+}
+
+/**
+ * Build all the variants of a string to check against bad words:
+ * 1. The raw content (punctuation → spaces, then normalize)
+ * 2. The spaced-letter-collapsed version
+ * 3. The fully stripped version (no spaces) — for cross-message sliding window only
+ */
+function buildCheckVariants(str) {
+  const lower      = str.toLowerCase();
+  const punctToSpc = stripPunctuation(lower);          // punctuation → spaces
+  const normalized = normalize(punctToSpc);            // collapse repeated chars
+  const collapsed  = collapseSpacedLetters(normalized); // "n a k" → "nak"
+
+  return [normalized, collapsed];
+}
+
+/**
+ * Check a single content string for bad words.
+ * Uses whole-word matching for Latin/digit words.
+ * For Arabic entries that start with a space (e.g. " زب") the leading space is
+ * the original author's way of saying "preceded by space" — we honour that as a
+ * boundary marker and strip it before matching.
+ */
+function isBadContent(content) {
+  // Emoji check — exact substring match (emojis are always distinct)
+  if (emojiWords.some((e) => content.includes(e))) return true;
+
+  const variants = buildCheckVariants(content);
+
+  for (const badWord of badWords) {
+    // Normalize the bad word the same way
+    const normalizedBad = normalize(stripPunctuation(badWord.trim().toLowerCase()));
+    if (!normalizedBad) continue;
+
+    for (const variant of variants) {
+      if (containsWholeWord(variant, normalizedBad)) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * For the sliding-window (cross-message) check, we join recent message contents
+ * and check the combined string. We use the same isBadContent logic, which
+ * applies word-boundary checking on the joined text.
+ *
+ * We also check a "dense" join (no spaces) to catch the case where someone
+ * sends "na" then "k" across two messages — the dense join produces "nak"
+ * which then gets word-boundary checked against a padded version.
+ */
+function isBadInHistory(userId, currentContent) {
+  // First check the current message alone
+  if (isBadContent(currentContent)) return true;
+
+  const history = userMessageHistory.get(userId) ?? [];
+  if (history.length < 2) return false;
+
+  // Spaced join — normal sentence reconstruction
+  const spacedJoin = history.map((m) => m.content).join(" ");
+  if (isBadContent(spacedJoin)) return true;
+
+  // Dense join (no separator) — catches split-across-messages evasion like "na" + "k"
+  // We pad the dense result with spaces so word-boundary check works on it
+  const denseJoin  = " " + history.map((m) => m.content.trim()).join("") + " ";
+  if (isBadContent(denseJoin)) return true;
+
+  return false;
+}
+
+// ─── Text Helpers ─────────────────────────────────────────────────────────────
 function getForwardedContent(message) {
   return message.messageSnapshots
     ? [...message.messageSnapshots.values()].map((s) => s.content?.toLowerCase() || "").join(" ")
     : "";
-}
-function isBadContent(content) {
-  const n = normalize(content);
-  return badWords.some((w) => n.includes(normalize(w))) || emojiWords.some((e) => content.includes(e));
 }
 
 // ─── Sliding window (split-message detection) ─────────────────────────────────
@@ -344,10 +489,6 @@ function getRecentMessages(userId, msg) {
   const recent = hist.filter((m) => now - m.time < HISTORY_WINDOW);
   userMessageHistory.set(userId, recent);
   return recent;
-}
-function isBadInHistory(userId, content) {
-  const combined = normalize((userMessageHistory.get(userId) ?? []).map((m) => m.content).join(" "));
-  return isBadContent(content) || isBadContent(combined);
 }
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
