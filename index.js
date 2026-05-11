@@ -166,7 +166,8 @@ const client = new Client({
 });
 
 // ─── Features ─────────────────────────────────────────────────────────────────
-const features = { badwords: true, logs: true, counting: true };
+// ownerMention added here — toggleable via !toggle ownerMention
+const features = { badwords: true, logs: true, counting: true, ownerMention: true };
 
 // ─── Escalation Config (bad-word system) ──────────────────────────────────────
 const WARNS_BEFORE_TIMEOUT = 3;
@@ -192,16 +193,15 @@ function msToHuman(ms) {
 // ══════════════════════════════════════════════════════════════════════════════
 //  OWNER MENTION CONFIG  (completely standalone system)
 // ══════════════════════════════════════════════════════════════════════════════
-const OWNER_ID                    = "1432385060509581385";
-const OWNER_MENTION_WARNS_BEFORE_TIMEOUT = 3;          // 3 warnings → timeout
-const OWNER_MENTION_TIMEOUT_MS    = 10 * 60 * 1000;    // fixed 10-minute timeout
-const OWNER_MENTION_WARN_RESET_MS = 60 * 60 * 1000;    // warn counter resets after 1 h
+const OWNER_ID                           = "1432385060509581385";
+const OWNER_MENTION_WARNS_BEFORE_TIMEOUT = 3;
+const OWNER_MENTION_TIMEOUT_MS           = 10 * 60 * 1000;
+const OWNER_MENTION_WARN_RESET_MS        = 60 * 60 * 1000;
 
 async function handleOwnerMention(message) {
   const { author, guild, channel } = message;
   const now = new Date();
 
-  // Fetch or create the standalone offence record
   let doc = await OwnerMentionOffence.findOneAndUpdate(
     { userId: author.id, guildId: guild.id },
     { $setOnInsert: { username: author.username, mentions: 0, lastMentionAt: null, history: [], updatedAt: now } },
@@ -210,7 +210,6 @@ async function handleOwnerMention(message) {
 
   let { mentions, lastMentionAt } = doc;
 
-  // Reset counter if enough time has passed
   if (lastMentionAt && (now - lastMentionAt) > OWNER_MENTION_WARN_RESET_MS) {
     mentions = 0;
   }
@@ -238,15 +237,11 @@ async function handleOwnerMention(message) {
     }
 
     channel
-      .send(
-        `⏱️ ${author} , 3 fois t'as mentionné l'owner — get muted **10 min**. arka7 w ma t3awedch.`
-      )
+      .send(`⏱️ ${author} , 3 fois t'as mentionné l'owner — get muted **10 min**. arka7 w ma t3awedch.`)
       .then((m) => setTimeout(() => m.delete(), 8000));
 
     author
-      .send(
-        `Tu as été mute **10 minutes** pour avoir mentionné l'owner 3 fois.\nArka7 w barra men hadha.`
-      )
+      .send(`Tu as été mute **10 minutes** pour avoir mentionné l'owner 3 fois.\nArka7 w barra men hadha.`)
       .catch(() => {});
 
   } else {
@@ -450,6 +445,7 @@ const TOGGLE_HELP =
   "`!toggle badwords` — turn bad-word detection on/off\n" +
   "`!toggle logs` — turn mod-log embeds on/off\n" +
   "`!toggle counting` — turn the counting game on/off\n" +
+  "`!toggle ownerMention` — turn owner mention protection on/off\n" +
   "`!toggle status` — show current feature states";
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -671,7 +667,6 @@ async function handleConfig(message, args, cfg) {
           .then((m) => setTimeout(() => m.delete(), 5000));
       await GuildConfig.findOneAndUpdate({ guildId }, { $set: { countingChannelId: targetChannel.id, updatedAt: new Date() } }, { upsert: true });
       invalidateCache(guildId);
-      // Reset the count so the game starts fresh in the new channel
       await saveCountingState(guildId, { currentCount: 0, lastUserId: null, highScore: (await getCountingState(guildId)).highScore });
       return message.reply(`✅ Counting channel set to <#${targetChannel.id}>. Count reset to 0 — start from **1**!`);
     }
@@ -699,12 +694,17 @@ async function handleToggle(message, args, cfg) {
     );
   }
 
-  if (!Object.prototype.hasOwnProperty.call(features, feature)) {
+  // Case-insensitive match so "ownerMention" and "ownermention" both work
+  const matchedKey = Object.keys(features).find(
+    (k) => k.toLowerCase() === feature.toLowerCase()
+  );
+
+  if (!matchedKey) {
     return message.reply(TOGGLE_HELP);
   }
 
-  features[feature] = !features[feature];
-  message.reply(`✅ \`${feature}\` is now ${features[feature] ? "🟢 on" : "🔴 off"}`);
+  features[matchedKey] = !features[matchedKey];
+  message.reply(`✅ \`${matchedKey}\` is now ${features[matchedKey] ? "🟢 on" : "🔴 off"}`);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -893,12 +893,6 @@ async function handleDeafenVC(message, cfg) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  COUNTING GAME HANDLER
-//  Rules:
-//   • Only the configured counting channel is watched
-//   • Messages must be exactly the next integer (e.g. "42" or "  42  ")
-//   • The same user cannot count twice in a row
-//   • Any violation → delete message, react ❌, announce reset, restart from 1
-//   • New high score is celebrated with 🎉
 // ══════════════════════════════════════════════════════════════════════════════
 async function handleCounting(message) {
   const { author, guild, channel } = message;
@@ -906,7 +900,6 @@ async function handleCounting(message) {
 
   const parsed = parseInt(message.content.trim(), 10);
 
-  // Not a pure integer — delete silently and ignore (no reset)
   if (isNaN(parsed) || String(parsed) !== message.content.trim()) {
     await message.delete().catch(() => {});
     return;
@@ -915,7 +908,6 @@ async function handleCounting(message) {
   const isCorrectNumber = parsed === state.currentCount + 1;
   const isDoubleCount   = state.lastUserId === author.id;
 
-  // ── Valid count ────────────────────────────────────────────────────────────
   if (isCorrectNumber && !isDoubleCount) {
     state.currentCount = parsed;
     state.lastUserId   = author.id;
@@ -930,9 +922,8 @@ async function handleCounting(message) {
     return;
   }
 
-  // ── Violation — delete and reset ──────────────────────────────────────────
-  const prevCount   = state.currentCount;
-  const prevHigh    = state.highScore;
+  const prevCount    = state.currentCount;
+  const prevHigh     = state.highScore;
   state.currentCount = 0;
   state.lastUserId   = null;
   await saveCountingState(guild.id, state);
@@ -966,7 +957,7 @@ async function handleOffence(message, offendingContent) {
   );
 
   let { warns, lastWarnAt, timeouts, lastTimeoutAt } = doc;
-  if (lastWarnAt   && (now - lastWarnAt)   > WARN_RESET_MS)    warns    = 0;
+  if (lastWarnAt    && (now - lastWarnAt)    > WARN_RESET_MS)    warns    = 0;
   if (lastTimeoutAt && (now - lastTimeoutAt) > TIMEOUT_RESET_MS) timeouts = 0;
 
   warns += 1;
@@ -1393,17 +1384,18 @@ client.on("messageCreate", async (message) => {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  OWNER MENTION DETECTION  (standalone — does NOT touch bad-word counters)
+  //  OWNER MENTION DETECTION  (standalone — feature-toggled via ownerMention)
   //  • Superusers are exempt
   //  • exemptRoles are also exempt
   //  • Own separate MongoDB collection (OwnerMentionOffence)
   //  • 3 mentions → 10-minute timeout, counter resets after 1 h
+  //  Toggle: !toggle ownerMention
   // ══════════════════════════════════════════════════════════════════════════
   const isOwnerMentionExempt =
     isSuperuser(member) ||
     member?.roles?.cache.some((r) => cfg.exemptRoles.has(r.id));
 
-  if (!isOwnerMentionExempt && message.mentions.users.has(OWNER_ID)) {
+  if (features.ownerMention && !isOwnerMentionExempt && message.mentions.users.has(OWNER_ID)) {
     await message.delete().catch(() => {});
     try { await handleOwnerMention(message); }
     catch (err) { console.error("handleOwnerMention error:", err); }
