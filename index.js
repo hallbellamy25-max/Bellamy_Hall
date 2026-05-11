@@ -112,7 +112,7 @@ const ownerMentionSchema = new mongoose.Schema({
     }],
     default: [],
   },
-  updatedAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: null },
 });
 ownerMentionSchema.index({ userId: 1, guildId: 1 }, { unique: true });
 const OwnerMentionOffence = mongoose.model("OwnerMentionOffence", ownerMentionSchema);
@@ -894,13 +894,39 @@ async function handleDeafenVC(message, cfg) {
 // ══════════════════════════════════════════════════════════════════════════════
 //  COUNTING GAME HANDLER
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Safely evaluate a simple math expression — no eval abuse
+// Only allows digits, spaces, and basic operators: + - * / ( )
+function safeMathEval(expr) {
+  const sanitized = expr.trim().replace(/\s+/g, "");
+  if (!/^[\d+\-*/().]+$/.test(sanitized)) return null;
+  try {
+    const result = Function('"use strict"; return (' + sanitized + ')')();
+    if (typeof result !== "number" || !isFinite(result)) return null;
+    if (!Number.isInteger(result)) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 async function handleCounting(message) {
   const { author, guild, channel } = message;
   const state = await getCountingState(guild.id);
 
-  const parsed = parseInt(message.content.trim(), 10);
+  const raw = message.content.trim();
 
-  if (isNaN(parsed) || String(parsed) !== message.content.trim()) {
+  // Try direct integer first, then math expression
+  let parsed = null;
+  const directInt = parseInt(raw, 10);
+  if (!isNaN(directInt) && String(directInt) === raw) {
+    parsed = directInt;
+  } else {
+    parsed = safeMathEval(raw);
+  }
+
+  // Not a valid number or math expression → delete silently
+  if (parsed === null) {
     await message.delete().catch(() => {});
     return;
   }
@@ -916,27 +942,40 @@ async function handleCounting(message) {
 
     await saveCountingState(guild.id, state);
     await message.react("✅").catch(() => {});
+
+    // If they used a math expression, confirm the result so everyone can follow
+    const isMathExpr = String(parsed) !== raw;
+    if (isMathExpr) {
+      channel
+        .send(`🧮 \`${raw}\` = **${parsed}** ✓`)
+        .then((m) => setTimeout(() => m.delete(), 5000))
+        .catch(() => {});
+    }
+
     if (newHigh && parsed > 1) {
       channel.send(`🎉 New high score: **${parsed}**! Keep going!`).catch(() => {});
     }
     return;
   }
 
-  const prevCount    = state.currentCount;
-  const prevHigh     = state.highScore;
+  // Wrong number or double count → reset
+  const prevCount = state.currentCount;
+  const prevHigh  = state.highScore;
   state.currentCount = 0;
   state.lastUserId   = null;
   await saveCountingState(guild.id, state);
 
   await message.react("❌").catch(() => {});
 
+  const isMathExpr = String(parsed) !== raw;
   let reason;
   if (isDoubleCount && !isCorrectNumber) {
     reason = `${author} wrote twice in a row AND gave the wrong number`;
   } else if (isDoubleCount) {
     reason = `${author} wrote twice in a row`;
   } else {
-    reason = `${author} gave the wrong number (expected **${prevCount + 1}**, got **${message.content.trim().slice(0, 20)}**)`;
+    const shown = isMathExpr ? `\`${raw}\` = **${parsed}**` : `**${raw}**`;
+    reason = `${author} gave the wrong number (expected **${prevCount + 1}**, got ${shown})`;
   }
 
   channel.send(
